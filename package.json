@@ -1,0 +1,33 @@
+{
+  "name": "pi-emotion",
+  "version": "1.0.0",
+  "description": "Layered Emotion & Fatigue System Plugin for Pi Agent (State Persistence + Lazy Time Decay + Emotional Gravity + Pre-Prompt Hook)",
+  "type": "module",
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "keywords": [
+    "pi-package",
+    "emotion",
+    "fatigue",
+    "persona",
+    "pi-coding-agent"
+  ],
+  "bin": {
+    "emotion": "./bin/emotion.ts"
+  },
+  "scripts": {
+    "test": "node --test ./test/emotion.test.ts",
+    "emotion": "node ./bin/emotion.ts"
+  },
+  "pi": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-ai": "*",
+    "typebox": "*"
+  }
+}
