@@ -46,7 +46,19 @@ Or install as a local Pi package:
 pi install .
 ```
 
-### 3. CLI Usage
+### 3. AI Tools & `/emotion` Slash Command
+
+When loaded as a Pi extension, the plugin registers 6 AI tools and an interactive `/emotion` slash command:
+
+- `emotion_status` — inspect global Base Mood, shared Context Mood, Blended snapshot, and Fatigue
+- `emotion_get` — get the lazily decayed and gravity-blended emotion & fatigue JSON state
+- `emotion_set_base` — update global Base Mood (`mood`, `energy`, `valence`, `description`; 6h decay)
+- `emotion_set_context` — update shared short-term Context Mood (`mood`, `valence`, `trigger`; 2h decay, constrained by Emotional Gravity)
+- `rest` — reset workload fatigue to `0` and boost Base Mood energy (intended only when explicitly invited by the user)
+- `fatigue_status` — query lazily recovered workload fatigue (`0–100`) and current energy cap
+- `/emotion <status|get|set-base|set-context|rest|fatigue|workload>` — interactive slash command in Pi TUI with subcommand completions
+
+### 4. Standalone CLI Usage
 ```bash
 npm run emotion -- status
 npm run emotion -- get
@@ -60,11 +72,20 @@ npm run emotion -- fatigue 50
 
 ---
 
+## Configuration & Environment Variables
+
+- `options.baseline` (passed to `new EmotionEngine(options)` or `createEmotionExtension(options)`) seeds the initial state file when it is first created or recreated after corruption. Once a state file exists, update the persisted baseline via `engine.setBaseline(...)`.
+- `PI_EMOTION_STATE_PATH` — explicit state file path override (takes precedence over `PI_EMOTION_USER` and `PI_EMOTION_STATE_DIR`).
+- `PI_EMOTION_STATE_DIR` — directory for identity state files (defaults to `~/.pi/agent/emotion-state`, storing `<dir>/<identity>.json`).
+- `PI_EMOTION_USER` — selects a custom per-user persona identity (see Multi-User Identity below).
+
+---
+
 ## Isolation Model
 
 | Layer | Scope | Evolution |
 |---|---|---|
-| Baseline personality | per identity file | static config |
+| Baseline personality | per identity file | seeded from `options.baseline`, updated via `setBaseline()` |
 | Base Mood | shared within identity | 6h lazy decay → baseline |
 | Context Mood | shared within identity | 2h lazy decay → expires |
 | Fatigue | shared within identity | grows with `turn_end` workload, passively recovers over idle time (`15/hr`), or resets via `rest` |
@@ -84,11 +105,12 @@ export PI_EMOTION_USER=alice   # in each user's shell profile
 ```
 
 Resolution order: `PI_EMOTION_USER` > OS login username > `default`.
-A custom identity is stored at
-`~/.pi/agent/emotion-state/users/<identity>.json`. The default (unset)
-identity keeps using the legacy shared `~/.pi/agent/emotion-state.json`,
-so nothing breaks for single-user setups. The TUI status badge prefixes
-`alice·` when a custom identity is active.
+Every identity is stored uniformly at
+`<PI_EMOTION_STATE_DIR or ~/.pi/agent/emotion-state>/<identity>.json`
+(e.g. `~/.pi/agent/emotion-state/alice.json` or
+`~/.pi/agent/emotion-state/default.json`). The TUI status badge prefixes
+`alice·` when a custom identity is active (omitted for `default` and the
+current OS login).
 
 Within one identity, Base Mood, Context Mood, and Fatigue are all shared
 across sessions.

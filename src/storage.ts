@@ -17,14 +17,18 @@ export const DEFAULT_BASELINE: PersonalityBaseline = {
   description: "curious, slightly sassy, warm",
 };
 
-export function resolveDefaultStoragePath(): string {
-  return resolveStoragePath();
-}
-
 function nonEmpty(value: string | undefined): string | undefined {
   const trimmed = value?.trim();
   return trimmed ? trimmed : undefined;
 }
+
+const OS_USERNAME: string | undefined = (() => {
+  try {
+    return nonEmpty(os.userInfo().username);
+  } catch {
+    return undefined;
+  }
+})();
 
 /**
  * Resolve the current user identity for multi-user isolation.
@@ -38,26 +42,18 @@ export function resolveIdentity(explicit?: string): string {
   return (
     nonEmpty(explicit) ??
     nonEmpty(process.env.PI_EMOTION_USER) ??
-    nonEmpty(osUsername()) ??
+    OS_USERNAME ??
     "default"
   );
 }
 
-function osUsername(): string | undefined {
-  try {
-    return os.userInfo().username;
-  } catch {
-    return undefined;
-  }
-}
-
 /**
- * Whether an identity maps to a private per-user state file rather than
- * the shared default file (i.e. it is neither "default" nor the OS login).
+ * Whether an identity is a custom persona (neither "default" nor the OS login),
+ * used to decide whether the TUI status badge includes a persona prefix.
  */
 export function isCustomIdentity(identity: string): boolean {
   const trimmed = nonEmpty(identity);
-  return !!trimmed && trimmed !== "default" && trimmed !== osUsername();
+  return !!trimmed && trimmed !== "default" && trimmed !== OS_USERNAME;
 }
 
 /**
@@ -65,8 +61,7 @@ export function isCustomIdentity(identity: string): boolean {
  *
  * Precedence:
  * 1. `PI_EMOTION_STATE_PATH` env var (explicit file override)
- * 2. Custom identity (e.g. `PI_EMOTION_USER`) -> `<PI_EMOTION_STATE_DIR or ~/.pi/agent/emotion-state>/users/<identity>.json`
- * 3. Default / OS login -> `~/.pi/agent/emotion-state.json`
+ * 2. `<PI_EMOTION_STATE_DIR or ~/.pi/agent/emotion-state>/<identity>.json`
  */
 export function resolveStoragePath(identity?: string): string {
   const envPath = nonEmpty(process.env.PI_EMOTION_STATE_PATH);
@@ -74,47 +69,68 @@ export function resolveStoragePath(identity?: string): string {
     return path.resolve(envPath);
   }
 
-  const trimmed = nonEmpty(identity);
-  if (trimmed && isCustomIdentity(trimmed)) {
-    const dir =
-      nonEmpty(process.env.PI_EMOTION_STATE_DIR) ??
-      path.join(os.homedir(), ".pi", "agent", "emotion-state");
-    return path.join(dir, "users", `${sanitizeIdentity(trimmed)}.json`);
-  }
-
-  return path.join(os.homedir(), ".pi", "agent", "emotion-state.json");
+  const dir =
+    nonEmpty(process.env.PI_EMOTION_STATE_DIR) ??
+    path.join(os.homedir(), ".pi", "agent", "emotion-state");
+  const id = resolveIdentity(identity);
+  return path.resolve(dir, `${sanitizeIdentity(id)}.json`);
 }
 
 function sanitizeIdentity(identity: string): string {
-  return (
-    identity.replace(/[^a-zA-Z0-9._-]/g, "_").replace(/^\.+/, "") || "default"
-  );
+  const cleaned = identity
+    .toLowerCase()
+    .replace(/[^a-z0-9._-]/g, "_")
+    .replace(/^\.+/, "");
+  if (cleaned === identity && cleaned.length > 0) {
+    return cleaned;
+  }
+  const hash8 = crypto
+    .createHash("sha256")
+    .update(identity)
+    .digest("hex")
+    .slice(0, 8);
+  return `${cleaned || "default"}-${hash8}`;
 }
 
-export function clampNumber(val: number, min: number, max: number): number {
+export function clamp(val: number, min: number, max: number): number {
   if (!Number.isFinite(val)) return min;
   return Math.min(max, Math.max(min, val));
 }
 
-export function round1(val: number): number {
-  return Math.round(val * 10) / 10 || 0;
+export function round(val: number, decimals: number = 1): number {
+  const factor = 10 ** decimals;
+  return Math.round(val * factor) / factor || 0;
 }
 
-export function round2(val: number): number {
-  return Math.round(val * 100) / 100 || 0;
+export function finiteOr(
+  value: unknown,
+  fallback: number,
+  min: number = Number.NEGATIVE_INFINITY,
+  max: number = Number.POSITIVE_INFINITY,
+): number {
+  return typeof value === "number" && Number.isFinite(value)
+    ? Math.min(max, Math.max(min, value))
+    : fallback;
 }
 
-export function round3(val: number): number {
-  return Math.round(val * 1000) / 1000 || 0;
-}
-
-const LOCK_STALE_MS = 2_000;
-const LOCK_TIMEOUT_MS = 3_000;
+const RECLAIM_STALE_MS = 2_000;
+const LOCK_STALE_MS = 4_000;
+const LOCK_TIMEOUT_MS = 7_000;
 const LOCK_RETRY_BASE_MS = 5;
 const LOCK_SLEEP_ARRAY = new Int32Array(new SharedArrayBuffer(4));
 
 function sleepSync(ms: number): void {
   Atomics.wait(LOCK_SLEEP_ARRAY, 0, 0, Math.max(1, ms));
+}
+
+function releaseLockFile(filePath: string, token: string): void {
+  try {
+    if (fs.readFileSync(filePath, "utf8") === token) {
+      fs.rmSync(filePath, { force: true });
+    }
+  } catch {
+    // Ignore if already removed or unreadable
+  }
 }
 
 function isErrnoCode(err: unknown, code: string): boolean {
@@ -125,31 +141,10 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-function isFiniteNum(value: unknown): value is number {
-  return typeof value === "number" && Number.isFinite(value);
-}
-
 export function normalizeText(value: unknown, fallback: string): string {
   if (typeof value !== "string") return fallback;
   const trimmed = value.trim();
   return trimmed || fallback;
-}
-
-export function normalizeNumber(
-  value: unknown,
-  fallback: number,
-  min: number,
-  max: number,
-): number {
-  return isFiniteNum(value) ? round1(clampNumber(value, min, max)) : fallback;
-}
-
-function normalizeFatigueValue(value: unknown, fallback: number): number {
-  return isFiniteNum(value) ? round3(clampNumber(value, 0, 100)) : fallback;
-}
-
-function normalizeTimestamp(value: unknown, fallback: number): number {
-  return isFiniteNum(value) ? value : fallback;
 }
 
 export function normalizeBaseline(
@@ -158,13 +153,13 @@ export function normalizeBaseline(
 ): PersonalityBaseline {
   return {
     mood: normalizeText(raw?.mood, fallback.mood),
-    energy: normalizeNumber(raw?.energy, fallback.energy, 0, 10),
-    valence: normalizeNumber(raw?.valence, fallback.valence, 0, 10),
+    energy: round(finiteOr(raw?.energy, fallback.energy, 0, 10), 1),
+    valence: round(finiteOr(raw?.valence, fallback.valence, 0, 10), 1),
     description: normalizeText(raw?.description, fallback.description),
   };
 }
 
-export function createInitialState(
+function createInitialState(
   baselineOverrides?: Partial<PersonalityBaseline>,
   now: number = Date.now(),
 ): EmotionPersistedState {
@@ -195,15 +190,72 @@ export class EmotionStorage {
   private lockDepth = 0;
 
   constructor(filePath?: string, defaultBaseline?: Partial<PersonalityBaseline>) {
-    this.filePath = filePath ? path.resolve(filePath) : resolveDefaultStoragePath();
+    this.filePath = filePath
+      ? path.resolve(filePath)
+      : resolveStoragePath();
     this.defaultBaseline = normalizeBaseline(defaultBaseline, DEFAULT_BASELINE);
+  }
+
+  /**
+   * Serialize stale-lock reclamation with a short-lived `.reclaim` guard so
+   * concurrent contenders cannot unlink a lock freshly acquired by another process.
+   * Returns `true` when the lock is gone (reclaimed or already released) and the
+   * caller should retry immediately.
+   */
+  private tryReclaimStaleLock(lockPath: string): boolean {
+    let stat: fs.Stats;
+    try {
+      stat = fs.statSync(lockPath);
+    } catch (err) {
+      return isErrnoCode(err, "ENOENT");
+    }
+
+    if (Date.now() - stat.mtimeMs < LOCK_STALE_MS) {
+      return false;
+    }
+
+    const reclaimPath = `${lockPath}.reclaim`;
+    const reclaimToken = `${process.pid}:${crypto.randomBytes(6).toString("hex")}:${Date.now()}`;
+    let removed = false;
+    try {
+      fs.writeFileSync(reclaimPath, reclaimToken, {
+        flag: "wx",
+        encoding: "utf8",
+      });
+      try {
+        const currentStat = fs.statSync(lockPath);
+        if (Date.now() - currentStat.mtimeMs >= LOCK_STALE_MS) {
+          fs.rmSync(lockPath, { force: true });
+          removed = true;
+        }
+      } catch (err) {
+        if (isErrnoCode(err, "ENOENT")) {
+          removed = true;
+        }
+      } finally {
+        releaseLockFile(reclaimPath, reclaimToken);
+      }
+    } catch (err) {
+      if (isErrnoCode(err, "EEXIST")) {
+        try {
+          const reclaimStat = fs.statSync(reclaimPath);
+          if (Date.now() - reclaimStat.mtimeMs >= RECLAIM_STALE_MS) {
+            fs.rmSync(reclaimPath, { force: true });
+          }
+        } catch {
+          // Ignore if already removed
+        }
+      }
+    }
+
+    return removed;
   }
 
   /**
    * Execute `fn` under a re-entrant cross-process lockfile (`<filePath>.lock`)
    * to prevent lost updates across concurrent sessions / subagents.
    */
-  withLock<T>(fn: () => T): T {
+  withLock<T>(fn: () => T, timeoutMs: number = LOCK_TIMEOUT_MS): T {
     if (this.lockDepth > 0) {
       this.lockDepth += 1;
       try {
@@ -216,13 +268,11 @@ export class EmotionStorage {
     fs.mkdirSync(path.dirname(this.filePath), { recursive: true });
     const lockPath = `${this.filePath}.lock`;
     const token = `${process.pid}:${crypto.randomBytes(6).toString("hex")}:${Date.now()}`;
-    const deadline = Date.now() + LOCK_TIMEOUT_MS;
+    const deadline = Date.now() + timeoutMs;
 
-    let acquired = false;
-    while (!acquired) {
+    while (true) {
       try {
         fs.writeFileSync(lockPath, token, { flag: "wx", encoding: "utf8" });
-        acquired = true;
         break;
       } catch (err) {
         if (!isErrnoCode(err, "EEXIST")) {
@@ -230,24 +280,14 @@ export class EmotionStorage {
         }
       }
 
-      // Reclaim abandoned lock files left by crashed processes
-      try {
-        const stat = fs.statSync(lockPath);
-        if (Date.now() - stat.mtimeMs >= LOCK_STALE_MS) {
-          fs.rmSync(lockPath, { force: true });
-          continue;
-        }
-      } catch (err) {
-        if (isErrnoCode(err, "ENOENT")) {
-          continue;
-        }
-      }
-
+      const retryNow = this.tryReclaimStaleLock(lockPath);
       if (Date.now() >= deadline) {
-        break;
+        throw new Error(`Timed out acquiring emotion state lock: ${lockPath}`);
       }
 
-      sleepSync(LOCK_RETRY_BASE_MS + Math.floor(Math.random() * 10));
+      if (!retryNow) {
+        sleepSync(LOCK_RETRY_BASE_MS + Math.floor(Math.random() * 10));
+      }
     }
 
     this.lockDepth += 1;
@@ -255,15 +295,7 @@ export class EmotionStorage {
       return fn();
     } finally {
       this.lockDepth -= 1;
-      if (acquired) {
-        try {
-          if (fs.readFileSync(lockPath, "utf8") === token) {
-            fs.rmSync(lockPath, { force: true });
-          }
-        } catch {
-          // Ignore if already removed
-        }
-      }
+      releaseLockFile(lockPath, token);
     }
   }
 
@@ -275,31 +307,31 @@ export class EmotionStorage {
       if (isErrnoCode(err, "ENOENT")) return null;
       throw err;
     }
-    const parsed: unknown = JSON.parse(raw);
-    if (!isPlainObject(parsed)) {
-      throw new Error("Invalid persisted emotion state root");
+
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      return null;
     }
+
+    if (!isPlainObject(parsed)) {
+      return null;
+    }
+
     return this.normalizeState(parsed as Partial<EmotionPersistedState>, now);
   }
 
   load(now: number = Date.now()): EmotionPersistedState {
-    try {
-      const existing = this.tryReadNormalized(now);
-      if (existing) {
-        return existing;
-      }
-    } catch {
-      // Fall through to locked recovery below
+    const existing = this.tryReadNormalized(now);
+    if (existing) {
+      return existing;
     }
 
     return this.withLock(() => {
-      try {
-        const rechecked = this.tryReadNormalized(now);
-        if (rechecked) {
-          return rechecked;
-        }
-      } catch {
-        // Still corrupted under lock: overwrite with a fresh initial state
+      const rechecked = this.tryReadNormalized(now);
+      if (rechecked) {
+        return rechecked;
       }
       const initial = createInitialState(this.defaultBaseline, now);
       this.save(initial);
@@ -333,22 +365,20 @@ export class EmotionStorage {
 
     const base: BaseMoodState = {
       mood: normalizeText(parsed.base?.mood, baseline.mood),
-      energy: normalizeNumber(parsed.base?.energy, baseline.energy, 0, 10),
-      valence: normalizeNumber(parsed.base?.valence, baseline.valence, 0, 10),
+      energy: round(finiteOr(parsed.base?.energy, baseline.energy, 0, 10), 1),
+      valence: round(finiteOr(parsed.base?.valence, baseline.valence, 0, 10), 1),
       description: normalizeText(parsed.base?.description, baseline.description),
-      updatedAt: normalizeTimestamp(parsed.base?.updatedAt, now),
+      updatedAt: finiteOr(parsed.base?.updatedAt, now),
     };
 
     const context: ContextMoodState | null = normalizeContext(
-      parsed.context ?? (parsed as { contexts?: unknown }).contexts,
+      parsed.context,
       now,
     );
 
-    // Legacy files may include a `status` ("AWAKE" | "SLEEPING") field; drop it
-    // cleanly while preserving the recorded fatigue level and timestamp.
     const fatigue: FatigueState = {
-      fatigue: normalizeFatigueValue(parsed.fatigue?.fatigue, 0),
-      updatedAt: normalizeTimestamp(parsed.fatigue?.updatedAt, now),
+      fatigue: round(finiteOr(parsed.fatigue?.fatigue, 0, 0, 100), 3),
+      updatedAt: finiteOr(parsed.fatigue?.updatedAt, now),
     };
 
     return {
@@ -361,39 +391,16 @@ export class EmotionStorage {
   }
 }
 
-/**
- * Normalize whatever context shape is on disk to the current shared
- * single-context model. Migrates the legacy per-chatId `contexts` map by
- * keeping the most recently updated entry.
- */
 function normalizeContext(
   raw: unknown,
   now: number,
 ): ContextMoodState | null {
-  if (!isPlainObject(raw)) return null;
-
-  let candidate: Record<string, unknown>;
-
-  // Legacy migration: a map of chatId -> ContextMoodState.
-  // Keep the freshest entry as the shared context.
-  if (!("mood" in raw)) {
-    const entries = Object.values(raw).filter(
-      (c): c is Record<string, unknown> => isPlainObject(c) && "mood" in c,
-    );
-    if (entries.length === 0) return null;
-    candidate = entries.reduce((best, item) => {
-      const bestTime = isFiniteNum(best.updatedAt) ? best.updatedAt : -Infinity;
-      const itemTime = isFiniteNum(item.updatedAt) ? item.updatedAt : -Infinity;
-      return itemTime > bestTime ? item : best;
-    });
-  } else {
-    candidate = raw;
-  }
+  if (!isPlainObject(raw) || !("mood" in raw)) return null;
 
   return {
-    mood: normalizeText(candidate.mood, "neutral"),
-    valence: normalizeNumber(candidate.valence, 5, 0, 10),
-    trigger: typeof candidate.trigger === "string" ? candidate.trigger.trim() : "",
-    updatedAt: normalizeTimestamp(candidate.updatedAt, now),
+    mood: normalizeText(raw.mood, "neutral"),
+    valence: round(finiteOr(raw.valence, 5, 0, 10), 1),
+    trigger: typeof raw.trigger === "string" ? raw.trigger.trim() : "",
+    updatedAt: finiteOr(raw.updatedAt, now),
   };
 }

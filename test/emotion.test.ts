@@ -7,7 +7,6 @@ import { describe, it } from "node:test";
 import { fileURLToPath } from "node:url";
 import {
   BASE_DECAY_MS,
-  blendValenceWithGravity,
   CONTEXT_DECAY_MS,
   clampValenceByGravity,
   computeFatigueValencePenalty,
@@ -16,6 +15,7 @@ import {
   describeEnergyBehavior,
   describeValenceBehavior,
   EmotionEngine,
+  EmotionStorage,
   executeCliCommand,
   formatEmotionStatusBadge,
   isCustomIdentity,
@@ -24,21 +24,73 @@ import {
   tokenizeArgs,
 } from "../src/index.ts";
 
-function createTempStateFile(): { filePath: string; cleanup: () => void } {
+function withTempState<T>(fn: (filePath: string) => T): T {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-emotion-test-"));
   const filePath = path.join(tmpDir, "emotion-state.json");
-  return {
-    filePath,
-    cleanup: () => {
-      fs.rmSync(tmpDir, { recursive: true, force: true });
+  const cleanup = () => fs.rmSync(tmpDir, { recursive: true, force: true });
+  let asyncCleanup = false;
+  try {
+    const result = fn(filePath);
+    if (result instanceof Promise) {
+      asyncCleanup = true;
+      return result.finally(cleanup) as T;
+    }
+    return result;
+  } finally {
+    if (!asyncCleanup) cleanup();
+  }
+}
+
+function withEnv<T>(
+  overrides: Record<string, string | undefined>,
+  fn: () => T,
+): T {
+  const previous = new Map<string, string | undefined>();
+  for (const [key, value] of Object.entries(overrides)) {
+    previous.set(key, process.env[key]);
+    if (value === undefined) delete process.env[key];
+    else process.env[key] = value;
+  }
+  const restore = () => {
+    for (const [key, value] of previous) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  };
+  let asyncRestore = false;
+  try {
+    const result = fn();
+    if (result instanceof Promise) {
+      asyncRestore = true;
+      return result.finally(restore) as T;
+    }
+    return result;
+  } finally {
+    if (!asyncRestore) restore();
+  }
+}
+
+function createMockPi() {
+  const tools = new Map<string, any>();
+  const commands = new Map<string, any>();
+  const handlers = new Map<string, Function[]>();
+  const pi: any = {
+    registerTool(def: any) {
+      tools.set(def.name, def);
+    },
+    registerCommand(name: string, def: any) {
+      commands.set(name, def);
+    },
+    on(event: string, fn: Function) {
+      handlers.set(event, [...(handlers.get(event) ?? []), fn]);
     },
   };
+  return { pi, tools, commands, handlers };
 }
 
 describe("Layered Emotion & Fatigue System Plugin", () => {
-  it("1. 6h Base Mood lazy decay smoothly interpolates and fully reverts to Default Baseline at >= 6h", () => {
-    const { filePath, cleanup } = createTempStateFile();
-    try {
+  it("1. 6h Base Mood lazy decay smoothly interpolates and fully reverts to Default Baseline at >= 6h", () =>
+    withTempState((filePath) => {
       let currentTime = 1_700_000_000_000;
       const engine = new EmotionEngine({
         storagePath: filePath,
@@ -82,14 +134,10 @@ describe("Layered Emotion & Fatigue System Plugin", () => {
       assert.equal(t6h.base.energy, 7);
       assert.equal(t6h.base.description, "curious, slightly sassy, warm");
       assert.equal(t6h.blended.mood, "cheerful");
-    } finally {
-      cleanup();
-    }
-  });
+    }));
 
-  it("2. 2h Context Mood lazy decay & shared across sessions", () => {
-    const { filePath, cleanup } = createTempStateFile();
-    try {
+  it("2. 2h Context Mood lazy decay & shared across sessions", () =>
+    withTempState((filePath) => {
       let currentTime = 1_700_000_000_000;
       const engine = new EmotionEngine({
         storagePath: filePath,
@@ -108,7 +156,7 @@ describe("Layered Emotion & Fatigue System Plugin", () => {
       assert.equal(afterSet.context.valence, 3);
       assert.equal(afterSet.context.remainingWeight, 1);
       assert.equal(afterSet.blended.mood, "frustrated");
-      // At t=0, blended.valence = round1(7 * 0.35 + 3 * 0.65) = 4.4
+      // At t=0, blended.valence = round(7 * 0.35 + 3 * 0.65, 1) = 4.4
       assert.equal(afterSet.blended.valence, 4.4);
 
       // Shared context: a mood set in one session is visible to all reads
@@ -135,14 +183,10 @@ describe("Layered Emotion & Fatigue System Plugin", () => {
 
       const status = engine.getStatus();
       assert.equal(status.context, null);
-    } finally {
-      cleanup();
-    }
-  });
+    }));
 
-  it("3. Emotional Gravity limits high Context stimulus when Base Mood is deeply low", () => {
-    const { filePath, cleanup } = createTempStateFile();
-    try {
+  it("3. Emotional Gravity limits high Context stimulus when Base Mood is deeply low", () =>
+    withTempState((filePath) => {
       const currentTime = 1_700_000_000_000;
       const engine = new EmotionEngine({
         storagePath: filePath,
@@ -159,10 +203,10 @@ describe("Layered Emotion & Fatigue System Plugin", () => {
         description: "feeling down after production outage",
       });
 
-      // Direct unit check on gravity clamping and blending (including out-of-range base clamping)
+      // Direct unit check on gravity clamping (including out-of-range base clamping)
       assert.equal(clampValenceByGravity(10, 1, 4), 5);
-      assert.equal(blendValenceWithGravity(15, 10, 0), 10);
-      assert.equal(blendValenceWithGravity(-5, 0, 0), 0);
+      assert.equal(clampValenceByGravity(8, 15, 4), 8);
+      assert.equal(clampValenceByGravity(0, -5, 4), 0);
 
       // Stimulate with an extreme positive Context event (valence = 10)
       const blended = engine.setContext({
@@ -180,14 +224,10 @@ describe("Layered Emotion & Fatigue System Plugin", () => {
       assert.equal(blended.blended.valence, 3.6);
       assert.ok(blended.blended.valence < 5);
       assert.ok(blended.blended.valence > blended.base.valence);
-    } finally {
-      cleanup();
-    }
-  });
+    }));
 
-  it("4. Workload fatigue caps energy, drags valence when exhausted, recovers lazily over idle time, and resets via rest()", () => {
-    const { filePath, cleanup } = createTempStateFile();
-    try {
+  it("4. Workload fatigue caps energy, drags valence when exhausted, recovers lazily over idle time, and resets via rest()", () =>
+    withTempState((filePath) => {
       let currentTime = 1_700_000_000_000;
       const engine = new EmotionEngine({
         storagePath: filePath,
@@ -203,7 +243,7 @@ describe("Layered Emotion & Fatigue System Plugin", () => {
 
       // Accumulate high fatigue (80/100):
       // - energy cap drops to 10 - 0.8 * 9 = 2.8
-      // - valence drag = ((80 - 60) / 40) * 1.5 = 0.75 => blended valence = round1(7 - 0.75) = 6.3
+      // - valence drag = ((80 - 60) / 40) * 1.5 = 0.75 => blended valence = round(7 - 0.75, 1) = 6.3
       const tired = engine.setFatigue(80);
       assert.equal(tired.fatigue.value, 80);
       assert.equal(tired.fatigue.energyCap, 2.8);
@@ -231,50 +271,24 @@ describe("Layered Emotion & Fatigue System Plugin", () => {
       assert.equal(recovered.base.energy, 7.7);
       assert.equal(recovered.blended.valence, recovered.base.valence);
 
-      // getFatigueStatus() also returns lazily recovered fatigue
-      const fatigueStatus = engine.getFatigueStatus();
-      assert.equal(fatigueStatus.value, 20);
-      assert.equal(fatigueStatus.energyCap, 8.2);
-
       // Call rest(): fatigue resets to 0, energy boosts to >= 8
       const rested = engine.rest();
       assert.equal(rested.fatigue.value, 0);
       assert.equal(rested.fatigue.energyCap, 10);
       assert.ok(rested.base.energy >= 8);
       assert.equal(rested.blended.energy, rested.base.energy);
-    } finally {
-      cleanup();
-    }
-  });
+    }));
 
-  it("5. Pre-Prompt Hook, turn_end workload hook, AI Tools (no sleep/wake), and CLI integrate end-to-end", async () => {
-    const { filePath, cleanup } = createTempStateFile();
-    try {
+  it("5. Pre-Prompt Hook, turn_end workload hook, AI Tools (no sleep/wake), and CLI integrate end-to-end", () =>
+    withTempState(async (filePath) => {
       const currentTime = 1_700_000_000_000;
       const ext = createEmotionExtension({
         storagePath: filePath,
         now: () => currentTime,
       });
 
-      const registeredTools = new Map<string, any>();
-      const registeredCommands = new Map<string, any>();
-      const eventHandlers = new Map<string, Function[]>();
-
-      const mockPi: any = {
-        registerTool(def: any) {
-          registeredTools.set(def.name, def);
-        },
-        registerCommand(name: string, def: any) {
-          registeredCommands.set(name, def);
-        },
-        on(event: string, handler: Function) {
-          const list = eventHandlers.get(event) ?? [];
-          list.push(handler);
-          eventHandlers.set(event, list);
-        },
-      };
-
-      ext(mockPi);
+      const { pi, tools, commands, handlers } = createMockPi();
+      ext(pi);
 
       // Verify the 6 active tools are registered and sleep/wake are gone
       for (const toolName of [
@@ -285,15 +299,15 @@ describe("Layered Emotion & Fatigue System Plugin", () => {
         "rest",
         "fatigue_status",
       ]) {
-        assert.ok(registeredTools.has(toolName), `Missing tool: ${toolName}`);
+        assert.ok(tools.has(toolName), `Missing tool: ${toolName}`);
       }
-      assert.equal(registeredTools.has("sleep"), false);
-      assert.equal(registeredTools.has("wake"), false);
+      assert.equal(tools.has("sleep"), false);
+      assert.equal(tools.has("wake"), false);
       assert.ok(
-        Array.isArray(registeredTools.get("rest").promptGuidelines) &&
-          registeredTools.get("rest").promptGuidelines.length > 0,
+        Array.isArray(tools.get("rest").promptGuidelines) &&
+          tools.get("rest").promptGuidelines.length > 0,
       );
-      assert.ok(registeredCommands.has("emotion"));
+      assert.ok(commands.has("emotion"));
 
       const mockCtx: any = {
         hasUI: false,
@@ -303,8 +317,7 @@ describe("Layered Emotion & Fatigue System Plugin", () => {
       };
 
       // Invoke emotion_set_context tool
-      const setCtxTool = registeredTools.get("emotion_set_context");
-      await setCtxTool.execute(
+      await tools.get("emotion_set_context").execute(
         "call-1",
         {
           mood: "playful",
@@ -318,7 +331,7 @@ describe("Layered Emotion & Fatigue System Plugin", () => {
 
       // Simulate a turn_end with 4 coding tool calls and 1 error:
       // fatigue += 2.0 (turn) + 4 * 0.5 (tools) + 1 * 1.0 (error) = 5.0
-      const turnEndHandlers = eventHandlers.get("turn_end") ?? [];
+      const turnEndHandlers = handlers.get("turn_end") ?? [];
       assert.equal(turnEndHandlers.length, 1);
       await turnEndHandlers[0](
         {
@@ -333,10 +346,10 @@ describe("Layered Emotion & Fatigue System Plugin", () => {
         },
         mockCtx,
       );
-      assert.equal(ext.engine.getFatigueStatus().value, 5);
+      assert.equal(ext.engine.getBlendedEmotion().fatigue.value, 5);
 
       // Trigger Pre-Prompt Hook (before_agent_start)
-      const beforeStartHandlers = eventHandlers.get("before_agent_start") ?? [];
+      const beforeStartHandlers = handlers.get("before_agent_start") ?? [];
       assert.equal(beforeStartHandlers.length, 1);
 
       const promptEvent: any = {
@@ -355,6 +368,7 @@ describe("Layered Emotion & Fatigue System Plugin", () => {
       assert.ok(sectionText.includes("[Emotion & Fatigue Context Block]"));
       assert.ok(sectionText.includes("BLENDED: playful"));
       assert.ok(sectionText.includes("FATIGUE: 5/100"));
+      assert.equal(sectionText.includes("Session ID"), false);
       assert.equal(sectionText.includes("Mind-Body Sync"), false);
       assert.equal(sectionText.includes("SLEEPING"), false);
 
@@ -381,14 +395,10 @@ describe("Layered Emotion & Fatigue System Plugin", () => {
         executeCliCommand(ext.engine, ["workload", "1", "2", "0"]),
       );
       assert.equal(workloadJson.fatigue.value, 8); // 5 + (2 + 2*0.5)
-    } finally {
-      cleanup();
-    }
-  });
+    }));
 
-  it("6. Workload edge cases: recovery before accumulation, per-turn cap, zero-delta no-op, and rest turn_end guard", async () => {
-    const { filePath, cleanup } = createTempStateFile();
-    try {
+  it("6. Workload edge cases: recovery before accumulation, per-turn cap, zero-delta no-op, and rest turn_end guard", () =>
+    withTempState(async (filePath) => {
       let currentTime = 1_700_000_000_000;
       const ext = createEmotionExtension({
         storagePath: filePath,
@@ -423,27 +433,21 @@ describe("Layered Emotion & Fatigue System Plugin", () => {
       const noop = engine.recordWorkload({ turns: 0, toolCalls: 0, toolErrors: 0 });
       assert.equal(noop.fatigue.updatedAt, prevUpdatedAt);
 
-      // Explicit fatigueDelta override works cleanly
+      // Explicit fatigueDelta override: 49 - (15 / 60) + 10 = 58.75 -> 58.8
       const explicit = engine.recordWorkload({ fatigueDelta: 10 });
-      assert.ok(explicit.fatigue.value >= 58 && explicit.fatigue.value <= 59);
+      assert.equal(explicit.fatigue.value, 58.8);
 
       // In Pi extension: a turn_end containing successful `rest` leaves fatigue at 0
-      const handlers = new Map<string, Function[]>();
-      ext({
-        registerTool() {},
-        registerCommand() {},
-        on(ev: string, fn: Function) {
-          handlers.set(ev, [...(handlers.get(ev) ?? []), fn]);
-        },
-      } as any);
+      const { pi, handlers } = createMockPi();
+      ext(pi);
 
       engine.rest();
-      assert.equal(engine.getFatigueStatus().value, 0);
+      assert.equal(engine.getBlendedEmotion().fatigue.value, 0);
       await handlers.get("turn_end")?.[0](
         { turnIndex: 1, toolResults: [{ toolName: "rest", isError: false }] },
         { hasUI: false },
       );
-      assert.equal(engine.getFatigueStatus().value, 0);
+      assert.equal(engine.getBlendedEmotion().fatigue.value, 0);
 
       // Aborted or provider-errored empty turns add no fatigue
       await handlers.get("turn_end")?.[0](
@@ -454,14 +458,14 @@ describe("Layered Emotion & Fatigue System Plugin", () => {
         { turnIndex: 3, outcome: "error", toolResults: [] },
         { hasUI: false },
       );
-      assert.equal(engine.getFatigueStatus().value, 0);
+      assert.equal(engine.getBlendedEmotion().fatigue.value, 0);
 
       // Failed `rest` (isError: true) does NOT suppress turn fatigue
       await handlers.get("turn_end")?.[0](
         { turnIndex: 4, toolResults: [{ toolName: "rest", isError: true }] },
         { hasUI: false },
       );
-      assert.equal(engine.getFatigueStatus().value, 2);
+      assert.equal(engine.getBlendedEmotion().fatigue.value, 2);
 
       // highFatigueValenceThreshold = 100 disables valence drag even at fatigue = 100
       const noDrag = new EmotionEngine({
@@ -482,142 +486,74 @@ describe("Layered Emotion & Fatigue System Plugin", () => {
       });
       hardened.setFatigue(40);
       hardened.setFatigue(Number.NaN);
-      assert.equal(hardened.getFatigueStatus().value, 40);
+      assert.equal(hardened.getBlendedEmotion().fatigue.value, 40);
       const afterNaNOptsWork = hardened.recordWorkload({ turns: 1 });
       assert.equal(afterNaNOptsWork.fatigue.value, 42);
       assert.equal(hardened.getStatus().blended.energy, afterNaNOptsWork.blended.energy);
-    } finally {
-      cleanup();
-    }
-  });
+    }));
 
-  it("7. Multi-user isolation via PI_EMOTION_USER identity files", () => {
-    const { filePath, cleanup } = createTempStateFile();
-    const stateDir = path.dirname(filePath);
-    const origEnv = {
-      PI_EMOTION_STATE_PATH: process.env.PI_EMOTION_STATE_PATH,
-      PI_EMOTION_STATE_DIR: process.env.PI_EMOTION_STATE_DIR,
-      PI_EMOTION_USER: process.env.PI_EMOTION_USER,
-    };
-    try {
-      process.env.PI_EMOTION_STATE_DIR = path.join(stateDir, "emotion-state");
-      delete process.env.PI_EMOTION_USER;
-      delete process.env.PI_EMOTION_STATE_PATH;
-
-      const alice = new EmotionEngine({ identity: "pi-emotion-test-alice" });
-      const bob = new EmotionEngine({ identity: "pi-emotion-test-bob" });
-
-      // Each custom identity gets a private file under emotion-state/users/
-      assert.ok(
-        alice.storage.filePath.endsWith(
-          path.join("users", "pi-emotion-test-alice.json"),
-        ),
-      );
-      assert.ok(
-        bob.storage.filePath.endsWith(
-          path.join("users", "pi-emotion-test-bob.json"),
-        ),
-      );
-      assert.notEqual(alice.storage.filePath, bob.storage.filePath);
-
-      // Alice accumulates fatigue; Bob is unaffected
-      alice.recordWorkload({ fatigueDelta: 40 });
-      assert.equal(alice.getFatigueStatus().value, 40);
-      assert.equal(bob.getFatigueStatus().value, 0);
-
-      // Bob's context mood does not leak into Alice's
-      bob.setContext({ mood: "annoyed", valence: 2, trigger: "noise" });
-      assert.equal(alice.getBlendedEmotion().context, null);
-      assert.equal(alice.identity, "pi-emotion-test-alice");
-      assert.equal(bob.identity, "pi-emotion-test-bob");
-
-      // Env-var driven identity also resolves
-      process.env.PI_EMOTION_USER = "pi-emotion-test-carol";
-      const carol = new EmotionEngine({});
-      assert.equal(carol.identity, "pi-emotion-test-carol");
-      assert.ok(
-        carol.storage.filePath.endsWith(
-          path.join("users", "pi-emotion-test-carol.json"),
-        ),
-      );
-    } finally {
-      if (origEnv.PI_EMOTION_STATE_PATH === undefined) {
-        delete process.env.PI_EMOTION_STATE_PATH;
-      } else {
-        process.env.PI_EMOTION_STATE_PATH = origEnv.PI_EMOTION_STATE_PATH;
-      }
-      if (origEnv.PI_EMOTION_STATE_DIR === undefined) {
-        delete process.env.PI_EMOTION_STATE_DIR;
-      } else {
-        process.env.PI_EMOTION_STATE_DIR = origEnv.PI_EMOTION_STATE_DIR;
-      }
-      if (origEnv.PI_EMOTION_USER === undefined) {
-        delete process.env.PI_EMOTION_USER;
-      } else {
-        process.env.PI_EMOTION_USER = origEnv.PI_EMOTION_USER;
-      }
-      cleanup();
-    }
-  });
-
-  it("8. Legacy per-chatId `contexts` dict and legacy `fatigue.status` migrate cleanly", () => {
-    const { filePath, cleanup } = createTempStateFile();
-    try {
-      const currentTime = 1_700_000_000_000;
-      const legacyState = {
-        version: 1,
-        baseline: {
-          mood: "cheerful",
-          energy: 7,
-          valence: 7,
-          description: "curious, slightly sassy, warm",
+  it("7. Multi-user isolation via PI_EMOTION_USER and uniform PI_EMOTION_STATE_DIR layout", () =>
+    withTempState((filePath) => {
+      const stateDir = path.join(path.dirname(filePath), "emotion-state");
+      return withEnv(
+        {
+          PI_EMOTION_STATE_DIR: stateDir,
+          PI_EMOTION_USER: undefined,
+          PI_EMOTION_STATE_PATH: undefined,
         },
-        base: {
-          mood: "cheerful",
-          energy: 7,
-          valence: 7,
-          description: "curious, slightly sassy, warm",
-          updatedAt: currentTime,
+        () => {
+          const alice = new EmotionEngine({ identity: "pi-emotion-test-alice" });
+          const bob = new EmotionEngine({ identity: "pi-emotion-test-bob" });
+
+          // Every identity (custom or default) is stored uniformly at <PI_EMOTION_STATE_DIR>/<identity>.json
+          assert.equal(
+            alice.storage.filePath,
+            path.join(stateDir, "pi-emotion-test-alice.json"),
+          );
+          assert.equal(
+            bob.storage.filePath,
+            path.join(stateDir, "pi-emotion-test-bob.json"),
+          );
+          assert.notEqual(alice.storage.filePath, bob.storage.filePath);
+
+          // Default and OS-login identities also honor PI_EMOTION_STATE_DIR uniformly
+          assert.equal(resolveStoragePath("default"), path.join(stateDir, "default.json"));
+          const osUser = os.userInfo().username;
+          assert.equal(resolveStoragePath(), resolveStoragePath(osUser));
+          assert.equal(path.dirname(resolveStoragePath(osUser)), stateDir);
+          assert.equal(isCustomIdentity("default"), false);
+          assert.equal(isCustomIdentity(osUser), false);
+          assert.equal(isCustomIdentity("pi-emotion-test-alice"), true);
+
+          // Alice accumulates fatigue; Bob is unaffected; non-finite nowOverride falls back to clock
+          alice.recordWorkload({ fatigueDelta: 40 });
+          assert.equal(alice.getBlendedEmotion(Number.NaN).fatigue.value, 40);
+          assert.equal(computeRecoveredFatigue(40, Number.NaN), 40);
+          assert.equal(bob.getBlendedEmotion().fatigue.value, 0);
+
+          // Bob's context mood does not leak into Alice's
+          bob.setContext({ mood: "annoyed", valence: 2, trigger: "noise" });
+          assert.equal(alice.getBlendedEmotion().context, null);
+          assert.equal(alice.identity, "pi-emotion-test-alice");
+          assert.equal(bob.identity, "pi-emotion-test-bob");
+
+          // Env-var driven identity resolves consistently across resolveStoragePath, EmotionEngine, and EmotionStorage
+          process.env.PI_EMOTION_USER = "pi-emotion-test-carol";
+          const carol = new EmotionEngine({});
+          assert.equal(carol.identity, "pi-emotion-test-carol");
+          assert.equal(
+            carol.storage.filePath,
+            path.join(stateDir, "pi-emotion-test-carol.json"),
+          );
+          assert.equal(resolveStoragePath(), carol.storage.filePath);
+          const directStorage = new EmotionStorage();
+          assert.equal(directStorage.filePath, carol.storage.filePath);
         },
-        contexts: {
-          "chat-a": {
-            mood: "nostalgic",
-            valence: 4,
-            trigger: "old photos",
-            updatedAt: currentTime - 60 * 60 * 1000,
-          },
-          "chat-b": {
-            mood: "determined",
-            valence: 8,
-            trigger: "fresh sprint kickoff",
-            updatedAt: currentTime - 10 * 60 * 1000,
-          },
-        },
-        fatigue: { status: "SLEEPING", fatigue: 45, updatedAt: currentTime },
-      };
-      fs.writeFileSync(filePath, JSON.stringify(legacyState, null, 2), "utf8");
+      );
+    }));
 
-      const engine = new EmotionEngine({
-        storagePath: filePath,
-        now: () => currentTime,
-      });
-
-      // The newest legacy entry (chat-b) becomes the shared context, and legacy fatigue.status is dropped cleanly
-      const blended = engine.getBlendedEmotion();
-      assert.ok(blended.context);
-      assert.equal(blended.context.mood, "determined");
-      assert.equal(blended.context.trigger, "fresh sprint kickoff");
-      assert.equal(blended.blended.mood, "determined");
-      assert.equal(blended.fatigue.value, 45);
-      assert.equal("status" in blended.fatigue, false);
-    } finally {
-      cleanup();
-    }
-  });
-
-  it("9. Corrupted state file falls back to a valid initial state and is rewritten", () => {
-    const { filePath, cleanup } = createTempStateFile();
-    try {
+  it("8. Corrupted state file falls back to a valid initial state and is rewritten", () =>
+    withTempState((filePath) => {
       const currentTime = 1_700_000_000_000;
       fs.writeFileSync(filePath, "not json{", "utf8");
 
@@ -639,14 +575,10 @@ describe("Layered Emotion & Fatigue System Plugin", () => {
       assert.equal(reloaded.base.mood, "cheerful");
       assert.equal(reloaded.fatigue.fatigue, 0);
       assert.equal("status" in reloaded.fatigue, false);
-    } finally {
-      cleanup();
-    }
-  });
+    }));
 
-  it("10. Shared context is persisted at disk level and visible to a second engine instance", () => {
-    const { filePath, cleanup } = createTempStateFile();
-    try {
+  it("9. Shared context is persisted at disk level and visible to a second engine instance", () =>
+    withTempState((filePath) => {
       const currentTime = 1_700_000_000_000;
       const first = new EmotionEngine({
         storagePath: filePath,
@@ -668,14 +600,10 @@ describe("Layered Emotion & Fatigue System Plugin", () => {
       assert.equal(blended.context.mood, "focused");
       assert.equal(blended.context.trigger, "deep work block");
       assert.equal(blended.blended.mood, "focused");
-    } finally {
-      cleanup();
-    }
-  });
+    }));
 
-  it("11. setFatigue() preserves base mood, description, 6h decay timer, and lets energy rebound dynamically", () => {
-    const { filePath, cleanup } = createTempStateFile();
-    try {
+  it("10. setFatigue() preserves base mood, description, 6h decay timer, and lets energy rebound dynamically", () =>
+    withTempState((filePath) => {
       let currentTime = 1_700_000_000_000;
       const engine = new EmotionEngine({
         storagePath: filePath,
@@ -708,14 +636,10 @@ describe("Layered Emotion & Fatigue System Plugin", () => {
       assert.equal(cleared.base.decayProgress, 0.5);
       assert.equal(cleared.base.energy, 6.5);
       assert.equal(cleared.base.valence, 7.5);
-    } finally {
-      cleanup();
-    }
-  });
+    }));
 
-  it("12. rest() keeps base mood/description coherent and boosts energy & valence", () => {
-    const { filePath, cleanup } = createTempStateFile();
-    try {
+  it("11. rest() keeps base mood/description coherent and boosts energy & valence", () =>
+    withTempState((filePath) => {
       const currentTime = 1_700_000_000_000;
       const engine = new EmotionEngine({
         storagePath: filePath,
@@ -738,14 +662,10 @@ describe("Layered Emotion & Fatigue System Plugin", () => {
       assert.equal(rested.base.description, "in the zone");
       assert.equal(rested.base.energy, 8);
       assert.equal(rested.base.valence, 7);
-    } finally {
-      cleanup();
-    }
-  });
+    }));
 
-  it("13. Exponential decay curve front-loads decay and honors exact 6h/2h boundaries", () => {
-    const { filePath, cleanup } = createTempStateFile();
-    try {
+  it("12. Exponential decay curve front-loads decay and honors exact 6h/2h boundaries", () =>
+    withTempState((filePath) => {
       let currentTime = 1_700_000_000_000;
       const engine = new EmotionEngine({
         storagePath: filePath,
@@ -779,14 +699,10 @@ describe("Layered Emotion & Fatigue System Plugin", () => {
       currentTime = 1_700_000_000_000 + BASE_DECAY_MS;
       assert.equal(engine.getBlendedEmotion().base.mood, "cheerful");
       assert.equal(engine.getBlendedEmotion().base.decayProgress, 1);
-    } finally {
-      cleanup();
-    }
-  });
+    }));
 
-  it("14. setBaseline() ignores NaN and blank strings without corrupting existing baseline", () => {
-    const { filePath, cleanup } = createTempStateFile();
-    try {
+  it("13. setBaseline() ignores NaN and blank strings without corrupting existing baseline", () =>
+    withTempState((filePath) => {
       const engine = new EmotionEngine({ storagePath: filePath });
       const updated = engine.setBaseline({
         mood: "   ",
@@ -799,79 +715,87 @@ describe("Layered Emotion & Fatigue System Plugin", () => {
       assert.equal(updated.energy, 7);
       assert.equal(updated.valence, 8.5);
       assert.equal(updated.description, "curious, slightly sassy, warm");
-    } finally {
-      cleanup();
-    }
-  });
+    }));
 
-  it("15. Storage resilience: non-object JSON roots, corrupted legacy contexts, whitespace env, dot identities", () => {
-    const { filePath, cleanup } = createTempStateFile();
-    const origPath = process.env.PI_EMOTION_STATE_PATH;
-    const origUser = process.env.PI_EMOTION_USER;
-    const origDir = process.env.PI_EMOTION_STATE_DIR;
-    try {
-      delete process.env.PI_EMOTION_STATE_PATH;
-      const currentTime = 1_700_000_000_000;
+  it("14. Storage resilience: non-object JSON roots, whitespace env, collision-free identities", () =>
+    withTempState((filePath) =>
+      withEnv(
+        {
+          PI_EMOTION_STATE_PATH: undefined,
+          PI_EMOTION_USER: undefined,
+          PI_EMOTION_STATE_DIR: undefined,
+        },
+        () => {
+          const currentTime = 1_700_000_000_000;
 
-      // Non-object JSON roots ("123", "[]", "null") all recover and rewrite valid JSON
-      for (const badRoot of ["123", "[]", "null", '"hello"']) {
-        fs.writeFileSync(filePath, badRoot, "utf8");
-        const engine = new EmotionEngine({ storagePath: filePath, now: () => currentTime });
-        const blended = engine.getBlendedEmotion();
-        assert.equal(blended.base.mood, "cheerful");
-        const disk = JSON.parse(fs.readFileSync(filePath, "utf8"));
-        assert.equal(disk.version, 1);
-      }
+          // Non-object JSON roots ("123", "[]", "null", '"hello"') all recover and rewrite valid JSON
+          for (const badRoot of ["123", "[]", "null", '"hello"']) {
+            fs.writeFileSync(filePath, badRoot, "utf8");
+            const engine = new EmotionEngine({ storagePath: filePath, now: () => currentTime });
+            const blended = engine.getBlendedEmotion();
+            assert.equal(blended.base.mood, "cheerful");
+            const disk = JSON.parse(fs.readFileSync(filePath, "utf8"));
+            assert.equal(disk.version, 1);
+          }
 
-      // Legacy contexts dict where first entry has invalid updatedAt still picks valid newest entry
-      fs.writeFileSync(
-        filePath,
-        JSON.stringify({
-          version: 1,
-          contexts: {
-            broken: { mood: "stale", valence: "bad", updatedAt: null },
-            valid: { mood: "relieved", valence: 8, trigger: "tests passed", updatedAt: currentTime - 1000 },
-          },
-        }),
-        "utf8",
-      );
-      const engine = new EmotionEngine({ storagePath: filePath, now: () => currentTime });
-      const blended = engine.getBlendedEmotion();
-      assert.ok(blended.context);
-      assert.equal(blended.context.mood, "relieved");
+          // Whitespace PI_EMOTION_USER / PI_EMOTION_STATE_DIR / identity fall through cleanly
+          process.env.PI_EMOTION_USER = "   ";
+          assert.notEqual(resolveIdentity(), "   ");
+          assert.equal(isCustomIdentity("   "), false);
+          assert.equal(resolveStoragePath("   "), resolveStoragePath());
+          assert.equal(
+            path.dirname(resolveStoragePath("   ")),
+            path.join(os.homedir(), ".pi", "agent", "emotion-state"),
+          );
 
-      // Whitespace PI_EMOTION_USER / PI_EMOTION_STATE_DIR / identity fall through cleanly
-      process.env.PI_EMOTION_USER = "   ";
-      assert.notEqual(resolveIdentity(), "   ");
-      assert.equal(isCustomIdentity("   "), false);
-      assert.ok(resolveStoragePath("   ").endsWith("emotion-state.json"));
+          process.env.PI_EMOTION_STATE_DIR = "   ";
+          const fallbackUserPath = resolveStoragePath("pi-emotion-test-trim");
+          assert.ok(
+            fallbackUserPath.endsWith(
+              path.join("emotion-state", "pi-emotion-test-trim.json"),
+            ),
+          );
 
-      process.env.PI_EMOTION_STATE_DIR = "   ";
-      const fallbackUserPath = resolveStoragePath("pi-emotion-test-trim");
-      assert.ok(fallbackUserPath.endsWith(path.join("emotion-state", "users", "pi-emotion-test-trim.json")));
+          // Dot-only, leading-dot, and non-ASCII identities sanitize safely without dotfiles, traversal, or collisions
+          const stateDir = path.dirname(filePath);
+          process.env.PI_EMOTION_STATE_DIR = stateDir;
 
-      // Dot-only identity sanitizes safely instead of creating a hidden/traversal path
-      process.env.PI_EMOTION_STATE_DIR = path.dirname(filePath);
-      const dotPath = resolveStoragePath("...");
-      assert.ok(dotPath.endsWith(path.join("users", "default.json")));
+          const dot3Path = resolveStoragePath("...");
+          const dot4Path = resolveStoragePath("....");
+          assert.equal(path.dirname(dot3Path), stateDir);
+          assert.equal(path.dirname(dot4Path), stateDir);
+          assert.equal(path.basename(dot3Path).startsWith("."), false);
+          assert.equal(path.basename(dot3Path).includes(".."), false);
+          assert.notEqual(dot3Path, dot4Path);
 
-      // Explicit PI_EMOTION_STATE_PATH overrides custom identity / PI_EMOTION_STATE_DIR
-      process.env.PI_EMOTION_STATE_PATH = filePath;
-      assert.equal(resolveStoragePath("pi-emotion-test-alice"), path.resolve(filePath));
-    } finally {
-      if (origPath === undefined) delete process.env.PI_EMOTION_STATE_PATH;
-      else process.env.PI_EMOTION_STATE_PATH = origPath;
-      if (origUser === undefined) delete process.env.PI_EMOTION_USER;
-      else process.env.PI_EMOTION_USER = origUser;
-      if (origDir === undefined) delete process.env.PI_EMOTION_STATE_DIR;
-      else process.env.PI_EMOTION_STATE_DIR = origDir;
-      cleanup();
-    }
-  });
+          const mingPath = resolveStoragePath("小明");
+          const hongPath = resolveStoragePath("小红");
+          assert.equal(path.dirname(mingPath), stateDir);
+          assert.equal(path.dirname(hongPath), stateDir);
+          assert.notEqual(mingPath, hongPath);
 
-  it("16. Badge formatting (normal & exhausted icon, no stray leading space) and UI status updates", async () => {
-    const { filePath, cleanup } = createTempStateFile();
-    try {
+          const dotBobPath = resolveStoragePath("..pi-emotion-test-bob");
+          const bobPath = resolveStoragePath("pi-emotion-test-bob");
+          assert.equal(path.dirname(dotBobPath), stateDir);
+          assert.equal(path.basename(dotBobPath).startsWith("."), false);
+          assert.equal(path.basename(bobPath), "pi-emotion-test-bob.json");
+          assert.notEqual(dotBobPath, bobPath);
+
+          const upperAlicePath = resolveStoragePath("pi-emotion-test-Alice");
+          const lowerAlicePath = resolveStoragePath("pi-emotion-test-alice");
+          assert.equal(path.dirname(upperAlicePath), stateDir);
+          assert.equal(path.basename(lowerAlicePath), "pi-emotion-test-alice.json");
+          assert.notEqual(upperAlicePath.toLowerCase(), lowerAlicePath.toLowerCase());
+
+          // Explicit PI_EMOTION_STATE_PATH overrides custom identity / PI_EMOTION_STATE_DIR
+          process.env.PI_EMOTION_STATE_PATH = filePath;
+          assert.equal(resolveStoragePath("pi-emotion-test-alice"), path.resolve(filePath));
+        },
+      ),
+    ));
+
+  it("15. Badge formatting (normal & exhausted icon, no stray leading space) and UI status updates", () =>
+    withTempState(async (filePath) => {
       const currentTime = 1_700_000_000_000;
       const ext = createEmotionExtension({
         storagePath: filePath,
@@ -888,18 +812,14 @@ describe("Layered Emotion & Fatigue System Plugin", () => {
 
       const exhausted = ext.engine.setFatigue(85);
       const tiredBadge = formatEmotionStatusBadge(exhausted, "alice");
-      assert.ok(tiredBadge.startsWith("alice·😪"), `Expected exhausted icon, got ${JSON.stringify(tiredBadge)}`);
+      assert.ok(
+        tiredBadge.startsWith("alice·😪"),
+        `Expected exhausted icon, got ${JSON.stringify(tiredBadge)}`,
+      );
       ext.engine.rest();
 
-      const handlers = new Map<string, Function[]>();
-      const mockPi: any = {
-        registerTool() {},
-        registerCommand() {},
-        on(event: string, fn: Function) {
-          handlers.set(event, [...(handlers.get(event) ?? []), fn]);
-        },
-      };
-      ext(mockPi);
+      const { pi, handlers } = createMockPi();
+      ext(pi);
 
       const statuses: Array<[string, string]> = [];
       const mockCtx: any = {
@@ -926,13 +846,13 @@ describe("Layered Emotion & Fatigue System Plugin", () => {
       assert.equal(statuses[0][0], "pi-emotion");
       assert.ok(statuses[0][1].startsWith("pi-emotion-test-alice·"));
       assert.equal(statuses[1][1], statuses[0][1]);
-      assert.ok(statuses[2][1].includes("F:2.5%"), `Expected updated fatigue badge, got ${statuses[2][1]}`);
-    } finally {
-      cleanup();
-    }
-  });
+      assert.ok(
+        statuses[2][1].includes("F:2.5%"),
+        `Expected updated fatigue badge, got ${statuses[2][1]}`,
+      );
+    }));
 
-  it("17. tokenizeArgs preserves contractions, and tools/CLI validate numeric inputs and removed commands", async () => {
+  it("16. tokenizeArgs preserves contractions, and tools/CLI validate numeric inputs and removed commands", () => {
     assert.deepEqual(
       tokenizeArgs(`set-context annoyed 3 user's build don't work`),
       ["set-context", "annoyed", "3", "user's", "build", "don't", "work"],
@@ -942,27 +862,16 @@ describe("Layered Emotion & Fatigue System Plugin", () => {
       ["set-base", "cheerful", "7", "7", "don't worry", "all good"],
     );
 
-    const { filePath, cleanup } = createTempStateFile();
-    try {
+    return withTempState(async (filePath) => {
       const ext = createEmotionExtension({ storagePath: filePath });
-      const registeredTools = new Map<string, any>();
-      const registeredCommands = new Map<string, any>();
-
-      ext({
-        registerTool(def: any) {
-          registeredTools.set(def.name, def);
-        },
-        registerCommand(name: string, def: any) {
-          registeredCommands.set(name, def);
-        },
-        on() {},
-      } as any);
+      const { pi, tools, commands } = createMockPi();
+      ext(pi);
 
       // Non-finite, blank string, or non-numeric primitive params in tools throw clearly instead of coercing to 0/1
       for (const badVal of ["oops", "", null, false, true, []]) {
         await assert.rejects(
           () =>
-            registeredTools.get("emotion_set_base").execute(
+            tools.get("emotion_set_base").execute(
               "c1",
               { mood: "happy", energy: badVal, valence: 7, description: "test" },
               undefined,
@@ -975,7 +884,7 @@ describe("Layered Emotion & Fatigue System Plugin", () => {
       for (const badVal of [Number.NaN, null, false, ""]) {
         await assert.rejects(
           () =>
-            registeredTools.get("emotion_set_context").execute(
+            tools.get("emotion_set_context").execute(
               "c2",
               { mood: "amused", valence: badVal, trigger: "joke" },
               undefined,
@@ -1003,10 +912,23 @@ describe("Layered Emotion & Fatigue System Plugin", () => {
       assert.throws(() => executeCliCommand(ext.engine, ["set-base", "happy", "", "5", "desc"]), /must be numbers/);
       assert.throws(() => executeCliCommand(ext.engine, ["sleep"]), /Unknown emotion command/);
       assert.throws(() => executeCliCommand(ext.engine, ["wake"]), /Unknown emotion command/);
+      for (const legacyAlias of [
+        "emotion_status",
+        "emotion_get",
+        "emotion_set_base",
+        "emotion_set_context",
+        "fatigue-status",
+        "fatigue_status",
+      ]) {
+        assert.throws(
+          () => executeCliCommand(ext.engine, [legacyAlias]),
+          /Unknown emotion command/,
+        );
+      }
       assert.throws(() => executeCliCommand(ext.engine, ["bogus"]), /Supported:.*workload/);
 
       const notifications: Array<[string, string]> = [];
-      await registeredCommands.get("emotion").handler("fatigue notanumber", {
+      await commands.get("emotion").handler("fatigue notanumber", {
         hasUI: true,
         ui: {
           setStatus() {},
@@ -1017,14 +939,11 @@ describe("Layered Emotion & Fatigue System Plugin", () => {
       });
       assert.equal(notifications.length, 1);
       assert.equal(notifications[0][1], "error");
-    } finally {
-      cleanup();
-    }
+    });
   });
 
-  it("18. High-frequency workload avoids double-rounding drift, expired setBase(NaN) falls back to decayed baseline, and high-fatigue prompt reflects energy cap", async () => {
-    const { filePath, cleanup } = createTempStateFile();
-    try {
+  it("17. High-frequency workload avoids double-rounding drift, expired setBase(NaN) falls back to decayed baseline, and high-fatigue prompt reflects energy cap", () =>
+    withTempState(async (filePath) => {
       let currentTime = 1_700_000_000_000;
       const ext = createEmotionExtension({
         storagePath: filePath,
@@ -1033,14 +952,13 @@ describe("Layered Emotion & Fatigue System Plugin", () => {
       const engine = ext.engine;
 
       // 30 rapid turns spaced 10s apart (5 minutes total = 1.25 pts idle recovery at 15 pts/hr).
-      // Exact accumulation: first turn +2 at t=0, then 29 turns each recovering 10/3600*15 (~0.0417) and adding +2:
-      // 30 * 2 - 29 * (15 * 10 / 3600) = 60 - 1.2083 = 58.7917 -> displayed as 58.8 (not 60.0 from swallowed rounding).
+      // Exact accumulation: 30 * 2 - 29 * (15 * 10 / 3600) = 60 - 1.2083 = 58.7917 -> 58.8.
       engine.recordWorkload({ turns: 1 });
       for (let i = 0; i < 29; i += 1) {
         currentTime += 10_000;
         engine.recordWorkload({ turns: 1 });
       }
-      assert.equal(engine.getFatigueStatus().value, 58.8);
+      assert.equal(engine.getBlendedEmotion().fatigue.value, 58.8);
 
       // Huge turns overflows safely to max fatigue 100 instead of NaN/0
       const overflowed = engine.recordWorkload({ turns: 1e308 });
@@ -1076,14 +994,8 @@ describe("Layered Emotion & Fatigue System Plugin", () => {
 
       // High-fatigue Pre-Prompt Hook reflects capped energy and tired guidance tier
       engine.setFatigue(85);
-      const handlers = new Map<string, Function[]>();
-      ext({
-        registerTool() {},
-        registerCommand() {},
-        on(event: string, fn: Function) {
-          handlers.set(event, [...(handlers.get(event) ?? []), fn]);
-        },
-      } as any);
+      const { pi, handlers } = createMockPi();
+      ext(pi);
 
       const promptEvent: any = {
         systemPrompt: "You are Pi.",
@@ -1101,49 +1013,46 @@ describe("Layered Emotion & Fatigue System Plugin", () => {
         section.includes("Current energy expression -> energy 0–3 (tired / worn out)"),
         section,
       );
-    } finally {
-      cleanup();
-    }
-  });
+    }));
 
-  it("19. Cross-process lockfile prevents lost updates under concurrent CLI writes and reclaims stale locks", async () => {
-    const { filePath, cleanup } = createTempStateFile();
-    const binPath = fileURLToPath(new URL("../bin/emotion.ts", import.meta.url));
+  it("18. Cross-process lockfile prevents lost updates under concurrent CLI writes and reclaims stale locks", () =>
+    withTempState(async (filePath) => {
+      const binPath = fileURLToPath(new URL("../bin/emotion.ts", import.meta.url));
 
-    const runCliChild = (args: string[]): Promise<void> =>
-      new Promise((resolve, reject) => {
-        const child = spawn(process.execPath, [binPath, ...args], {
-          env: {
-            ...process.env,
-            PI_EMOTION_STATE_PATH: filePath,
-          },
-          stdio: ["ignore", "pipe", "pipe"],
+      const runCliChild = (args: string[]): Promise<void> =>
+        new Promise((resolve, reject) => {
+          const child = spawn(process.execPath, [binPath, ...args], {
+            env: {
+              ...process.env,
+              PI_EMOTION_STATE_PATH: filePath,
+            },
+            stdio: ["ignore", "pipe", "pipe"],
+          });
+          let stderr = "";
+          child.stderr.on("data", (chunk) => {
+            stderr += String(chunk);
+          });
+          child.on("error", reject);
+          child.on("close", (code) => {
+            if (code === 0) resolve();
+            else reject(new Error(`CLI child failed (${code}): ${stderr}`));
+          });
         });
-        let stderr = "";
-        child.stderr.on("data", (chunk) => {
-          stderr += String(chunk);
-        });
-        child.on("error", reject);
-        child.on("close", (code) => {
-          if (code === 0) resolve();
-          else reject(new Error(`CLI child failed (${code}): ${stderr}`));
-        });
-      });
 
-    try {
       // Seed state file once
       const engine = new EmotionEngine({ storagePath: filePath });
       engine.getBlendedEmotion();
 
-      // Plant a stale lockfile (mtime > 10s ago) and verify automatic reclamation
+      // Plant a stale lockfile (mtime > LOCK_STALE_MS = 4s ago) and verify automatic reclamation
       const lockPath = `${filePath}.lock`;
       fs.writeFileSync(lockPath, "999999:dead:0", "utf8");
       const oldDate = new Date(Date.now() - 15_000);
       fs.utimesSync(lockPath, oldDate, oldDate);
 
       engine.recordWorkload({ fatigueDelta: 5 });
-      assert.equal(engine.getFatigueStatus().value, 5);
+      assert.equal(engine.getBlendedEmotion().fatigue.value, 5);
       assert.equal(fs.existsSync(lockPath), false);
+      assert.equal(fs.existsSync(`${lockPath}.reclaim`), false);
 
       // Launch 6 concurrent child processes: 5 adding 4 pts workload each (turns=1, toolCalls=4)
       // plus 1 setting shared context mood. All 5 increments and the context write must survive.
@@ -1165,8 +1074,217 @@ describe("Layered Emotion & Fatigue System Plugin", () => {
       assert.ok(final.context, "Concurrent set-context must not be clobbered by workload writes");
       assert.equal(final.context.mood, "excited");
       assert.equal(fs.existsSync(lockPath), false);
-    } finally {
-      cleanup();
-    }
-  });
+    }));
+
+  it("19. withLock() fails closed on timeout with clean lockDepth, and load() propagates non-corruption OS errors", () =>
+    withTempState((filePath) => {
+      const storage = new EmotionStorage(filePath);
+      const lockPath = `${filePath}.lock`;
+
+      // Hold a fresh lockfile so acquisition times out quickly
+      fs.writeFileSync(lockPath, "999999:active:1", "utf8");
+      let ranUnlocked = false;
+      assert.throws(
+        () =>
+          storage.withLock(() => {
+            ranUnlocked = true;
+          }, 40),
+        /Timed out acquiring emotion state lock/,
+      );
+      assert.equal(ranUnlocked, false);
+      assert.equal(fs.existsSync(lockPath), true);
+
+      // Confirm lockDepth did not leak above 0: a second acquisition while lockPath still exists must still time out
+      assert.throws(
+        () => storage.withLock(() => "never", 20),
+        /Timed out acquiring emotion state lock/,
+      );
+
+      // After lock is released, lockDepth must still be 0 so subsequent acquisitions actually acquire and release lockPath
+      fs.rmSync(lockPath, { force: true });
+      const result = storage.withLock(() => {
+        assert.equal(fs.existsSync(lockPath), true);
+        return "ok";
+      }, 200);
+      assert.equal(result, "ok");
+      assert.equal(fs.existsSync(lockPath), false);
+
+      // Plant both a stale .lock and a stale .lock.reclaim (> LOCK_STALE_MS = 4s / RECLAIM_STALE_MS = 2s) and verify withLock reclaims both
+      const reclaimPath = `${lockPath}.reclaim`;
+      const staleDate = new Date(Date.now() - 15_000);
+      fs.writeFileSync(lockPath, "999999:dead:0", "utf8");
+      fs.writeFileSync(reclaimPath, "999999:dead-reclaim:0", "utf8");
+      fs.utimesSync(lockPath, staleDate, staleDate);
+      fs.utimesSync(reclaimPath, staleDate, staleDate);
+
+      const reclaimedResult = storage.withLock(() => "reclaimed", 500);
+      assert.equal(reclaimedResult, "reclaimed");
+      assert.equal(fs.existsSync(lockPath), false);
+      assert.equal(fs.existsSync(reclaimPath), false);
+
+      // load() must propagate real OS errors (e.g. EISDIR) instead of silently resetting/overwriting
+      const dirAsStatePath = path.join(path.dirname(filePath), "state-is-a-dir");
+      fs.mkdirSync(dirAsStatePath);
+      const dirStorage = new EmotionStorage(dirAsStatePath);
+      assert.throws(
+        () => dirStorage.load(),
+        (err: unknown) => (err as NodeJS.ErrnoException)?.code === "EISDIR",
+      );
+      assert.equal(fs.statSync(dirAsStatePath).isDirectory(), true);
+    }));
+
+  it("20. forceSystemPrompt uses fallback append, base drop re-clamps context gravity, and fatigue drag combines with context", () =>
+    withTempState(async (filePath) => {
+      const currentTime = 1_700_000_000_000;
+      const ext = createEmotionExtension({
+        storagePath: filePath,
+        now: () => currentTime,
+      });
+      const { pi, handlers } = createMockPi();
+      ext(pi);
+
+      // 1) When forceSystemPrompt is set even alongside sections, before_agent_start must append to systemPrompt
+      const forcedEvent: any = {
+        systemPrompt: "Forced system prompt.",
+        systemPromptOptions: {
+          forceSystemPrompt: "Forced system prompt.",
+          sections: {},
+        },
+      };
+      const forcedResult = await handlers.get("before_agent_start")?.[0](
+        forcedEvent,
+        { hasUI: false, sessionManager: { getSessionId: () => "forced-sess" } },
+      );
+      assert.ok(forcedResult?.systemPrompt.startsWith("Forced system prompt.\n\n"));
+      assert.ok(forcedResult?.systemPrompt.includes("[Emotion & Fatigue Context Block]"));
+      assert.equal(forcedEvent.systemPromptOptions.sections.emotion_and_fatigue, undefined);
+
+      // 2) Lowering base valence while context is active re-clamps context valence on read
+      const engine = ext.engine;
+      engine.setBase({ mood: "upbeat", energy: 8, valence: 8, description: "high spirits" });
+      engine.setContext({ mood: "thrilled", valence: 10, trigger: "big win" });
+      assert.equal(engine.getBlendedEmotion().context?.valence, 10);
+
+      const afterBaseDrop = engine.setBase({
+        mood: "drained",
+        energy: 3,
+        valence: 1,
+        description: "sudden setback",
+      });
+      // Gravity re-clamps stored context valence (10) to base (1) + 4 = 5 on read
+      assert.equal(afterBaseDrop.context?.valence, 5);
+      // Blended valence = round(1 * 0.35 + 5 * 0.65, 1) = 3.6
+      assert.equal(afterBaseDrop.blended.valence, 3.6);
+
+      // 3) High-fatigue valence drag combines with active context and clamps cleanly at 0
+      const withDrag = engine.setFatigue(100); // max penalty = 1.5
+      // 3.6 - 1.5 = 2.1
+      assert.equal(withDrag.blended.valence, 2.1);
+
+      engine.setBase({ mood: "crushed", energy: 1, valence: 0.5, description: "rock bottom" });
+      engine.setContext({ mood: "bleak", valence: 0, trigger: "another outage" });
+      const clampedZero = engine.getBlendedEmotion();
+      // Raw blended = 0.5 * 0.35 + 0 * 0.65 = 0.175; 0.175 - 1.5 -> clamped to 0
+      assert.equal(clampedZero.blended.valence, 0);
+    }));
+
+  it("21. All 6 registered tools, /emotion slash command + completions, and CLI subcommands work end-to-end", () =>
+    withTempState(async (filePath) => {
+      const currentTime = 1_700_000_000_000;
+      const ext = createEmotionExtension({
+        storagePath: filePath,
+        now: () => currentTime,
+      });
+      const { pi, tools, commands } = createMockPi();
+      ext(pi);
+
+      const statuses: string[] = [];
+      const notifications: Array<[string, string]> = [];
+      const uiCtx: any = {
+        hasUI: true,
+        ui: {
+          setStatus(_key: string, value: string) {
+            statuses.push(value);
+          },
+          notify(msg: string, level: string) {
+            notifications.push([msg, level]);
+          },
+        },
+        sessionManager: { getSessionId: () => "tool-sess" },
+      };
+
+      // Exercise all 6 registered tool handlers
+      const setBaseRes = await tools.get("emotion_set_base").execute(
+        "t1",
+        { mood: "focused", energy: 6, valence: 5, description: "deep work" },
+        undefined,
+        undefined,
+        uiCtx,
+      );
+      assert.equal(setBaseRes.details.base.mood, "focused");
+
+      const setCtxRes = await tools.get("emotion_set_context").execute(
+        "t2",
+        { mood: "amused", valence: 8, trigger: "funny bug" },
+        undefined,
+        undefined,
+        uiCtx,
+      );
+      assert.equal(setCtxRes.details.context.mood, "amused");
+
+      const getRes = await tools.get("emotion_get").execute("t3", {}, undefined, undefined, uiCtx);
+      assert.equal(getRes.details.blended.mood, "amused");
+
+      const statusRes = await tools.get("emotion_status").execute("t4", {}, undefined, undefined, uiCtx);
+      assert.equal(statusRes.details.base.mood, "focused");
+      assert.deepEqual(statusRes.details.context, getRes.details.context);
+      assert.equal("blendedValence" in statusRes.details.context, false);
+
+      ext.engine.setFatigue(50);
+      const fatigueRes = await tools.get("fatigue_status").execute("t5", {}, undefined, undefined, uiCtx);
+      assert.equal(fatigueRes.details.value, 50);
+
+      const restRes = await tools.get("rest").execute("t6", {}, undefined, undefined, uiCtx);
+      assert.equal(restRes.details.fatigue.value, 0);
+      assert.equal(statuses.length, 6);
+
+      // Exercise /emotion slash command completions and happy-path handler
+      const emotionCmd = commands.get("emotion");
+      assert.deepEqual(
+        emotionCmd.getArgumentCompletions("set-").map((c: any) => c.value),
+        ["set-base", "set-context"],
+      );
+      assert.equal(emotionCmd.getArgumentCompletions("zzz"), null);
+
+      await emotionCmd.handler("status", uiCtx);
+      assert.equal(notifications.length, 1);
+      assert.equal(notifications[0][1], "info");
+      assert.equal(JSON.parse(notifications[0][0]).blended.mood, "amused");
+
+      // Exercise CLI happy paths: status, set-base, set-context, fatigue [val], fatigue, rest
+      const cliBase = JSON.parse(
+        executeCliCommand(ext.engine, ["set-base", "calm", "5", "6", "after", "refactor"]),
+      );
+      assert.equal(cliBase.base.mood, "calm");
+      assert.equal(cliBase.base.description, "after refactor");
+
+      const cliCtx = JSON.parse(
+        executeCliCommand(ext.engine, ["set-context", "proud", "9", "all", "tests", "green"]),
+      );
+      assert.equal(cliCtx.context.mood, "proud");
+      assert.equal(cliCtx.context.trigger, "all tests green");
+
+      const cliFatigueSet = JSON.parse(executeCliCommand(ext.engine, ["fatigue", "40"]));
+      assert.equal(cliFatigueSet.fatigue.value, 40);
+
+      const cliFatigueGet = JSON.parse(executeCliCommand(ext.engine, ["fatigue"]));
+      assert.equal(cliFatigueGet.value, 40);
+
+      const cliRest = JSON.parse(executeCliCommand(ext.engine, ["rest"]));
+      assert.equal(cliRest.fatigue.value, 0);
+
+      const cliStatus = JSON.parse(executeCliCommand(ext.engine, ["status"]));
+      assert.equal(cliStatus.base.mood, "calm");
+      assert.equal(cliStatus.fatigue.value, 0);
+    }));
 });

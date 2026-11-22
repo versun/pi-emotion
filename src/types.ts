@@ -114,11 +114,7 @@ export interface EmotionSystemStatus {
   base: BlendedEmotionResult["base"] & {
     raw: BaseMoodState;
   };
-  context:
-    | (NonNullable<BlendedEmotionResult["context"]> & {
-        blendedValence: number;
-      })
-    | null;
+  context: BlendedEmotionResult["context"];
   blended: BlendedEmotionResult["blended"];
   fatigue: BlendedEmotionResult["fatigue"] & {
     raw: FatigueState;
@@ -129,12 +125,12 @@ export interface EmotionSystemStatus {
  * Configuration options for EmotionEngine.
  */
 export interface EmotionEngineOptions {
-  /** Path to persistent JSON file. Defaults to PI_EMOTION_STATE_PATH, per-user file when PI_EMOTION_USER is set, or ~/.pi/agent/emotion-state.json */
+  /** Path to persistent JSON file. Defaults to PI_EMOTION_STATE_PATH or <PI_EMOTION_STATE_DIR or ~/.pi/agent/emotion-state>/<identity>.json */
   storagePath?: string;
   /**
    * User identity for multi-user isolation on a shared machine/account.
    * Defaults to PI_EMOTION_USER > OS username > "default".
-   * A custom identity gets its own state file under emotion-state/users/.
+   * Stored at <PI_EMOTION_STATE_DIR or ~/.pi/agent/emotion-state>/<identity>.json.
    */
   identity?: string;
   /** Default personality baseline */

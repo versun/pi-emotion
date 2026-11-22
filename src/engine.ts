@@ -1,14 +1,12 @@
 import {
-  clampNumber,
+  clamp,
   EmotionStorage,
+  finiteOr,
   normalizeBaseline,
-  normalizeNumber,
   normalizeText,
   resolveIdentity,
   resolveStoragePath,
-  round1,
-  round2,
-  round3,
+  round,
 } from "./storage.ts";
 import type {
   BlendedEmotionResult,
@@ -55,17 +53,6 @@ export const DEFAULT_HIGH_FATIGUE_VALENCE_THRESHOLD = 60;
 /** Maximum valence drag applied at 100 fatigue */
 export const DEFAULT_MAX_FATIGUE_VALENCE_PENALTY = 1.5;
 
-function finiteOr(
-  value: number | undefined,
-  fallback: number,
-  min: number = 0,
-  max: number = Number.POSITIVE_INFINITY,
-): number {
-  return typeof value === "number" && Number.isFinite(value)
-    ? clampNumber(value, min, max)
-    : fallback;
-}
-
 /**
  * Compute normalized interpolation progress [0, 1] over a decay window.
  * Supports both linear and smooth exponential decay curves that reach 1.0 at `windowMs`.
@@ -76,7 +63,7 @@ export function computeDecayFactor(
   curve: DecayCurve = "linear",
 ): number {
   if (windowMs <= 0) return 1;
-  const linear = clampNumber(elapsedMs / windowMs, 0, 1);
+  const linear = clamp(elapsedMs / windowMs, 0, 1);
   if (linear >= 1) return 1;
   if (linear <= 0) return 0;
 
@@ -92,12 +79,12 @@ function computeRawRecoveredFatigue(
   elapsedMs: number,
   recoveryPerHour: number = DEFAULT_FATIGUE_RECOVERY_PER_HOUR,
 ): number {
-  const start = clampNumber(rawFatigue, 0, 100);
-  if (start <= 0 || elapsedMs <= 0 || recoveryPerHour <= 0) {
+  const start = clamp(rawFatigue, 0, 100);
+  if (start <= 0 || !(elapsedMs > 0) || !(recoveryPerHour > 0)) {
     return start;
   }
   const elapsedHours = elapsedMs / (60 * 60 * 1000);
-  return clampNumber(start - elapsedHours * recoveryPerHour, 0, 100);
+  return clamp(start - elapsedHours * recoveryPerHour, 0, 100);
 }
 
 /**
@@ -108,7 +95,7 @@ export function computeRecoveredFatigue(
   elapsedMs: number,
   recoveryPerHour: number = DEFAULT_FATIGUE_RECOVERY_PER_HOUR,
 ): number {
-  return round1(computeRawRecoveredFatigue(rawFatigue, elapsedMs, recoveryPerHour));
+  return round(computeRawRecoveredFatigue(rawFatigue, elapsedMs, recoveryPerHour), 1);
 }
 
 /**
@@ -116,19 +103,8 @@ export function computeRecoveredFatigue(
  * Linearly scales from 10.0 (at fatigue 0) down to 1.0 (at fatigue 100).
  */
 export function computeEnergyCapFromFatigue(fatigueValue: number): number {
-  const f = clampNumber(fatigueValue, 0, 100);
-  return round1(10 - (f / 100) * 9);
-}
-
-/**
- * Constrain raw energy [0, 10] by the current fatigue ceiling.
- */
-export function computeEffectiveEnergy(
-  rawEnergy: number,
-  fatigueValue: number,
-): number {
-  const cap = computeEnergyCapFromFatigue(fatigueValue);
-  return round1(clampNumber(Math.min(rawEnergy, cap), 0, 10));
+  const f = clamp(fatigueValue, 0, 100);
+  return round(10 - (f / 100) * 9, 1);
 }
 
 /**
@@ -141,8 +117,8 @@ export function computeFatigueValencePenalty(
   threshold: number = DEFAULT_HIGH_FATIGUE_VALENCE_THRESHOLD,
   maxPenalty: number = DEFAULT_MAX_FATIGUE_VALENCE_PENALTY,
 ): number {
-  const f = clampNumber(fatigueValue, 0, 100);
-  const t = clampNumber(threshold, 0, 100);
+  const f = clamp(fatigueValue, 0, 100);
+  const t = clamp(threshold, 0, 100);
   const penalty = Math.max(0, maxPenalty);
   if (t >= 100 || f <= t || penalty <= 0) return 0;
   return ((f - t) / (100 - t)) * penalty;
@@ -158,34 +134,16 @@ export function clampValenceByGravity(
   baseValence: number,
   maxDelta: number = DEFAULT_MAX_GRAVITY_DELTA,
 ): number {
-  const clampedTarget = clampNumber(targetValence, 0, 10);
-  const clampedBase = clampNumber(baseValence, 0, 10);
+  const clampedBase = clamp(baseValence, 0, 10);
   const delta = Math.max(0, maxDelta);
-  return round1(
-    clampNumber(
-      clampedTarget,
+  return round(
+    clamp(
+      targetValence,
       Math.max(0, clampedBase - delta),
       Math.min(10, clampedBase + delta),
     ),
+    1,
   );
-}
-
-/**
- * Emotional Gravity Blending Function:
- * Combines Base valence and gravity-clamped Context valence, weighted by Context's remaining freshness.
- */
-export function blendValenceWithGravity(
-  baseValence: number,
-  contextValence: number,
-  remainingWeight: number,
-  contextWeight: number = DEFAULT_CONTEXT_WEIGHT,
-  maxDelta: number = DEFAULT_MAX_GRAVITY_DELTA,
-): number {
-  const clampedBase = clampNumber(baseValence, 0, 10);
-  const clampedContext = clampValenceByGravity(contextValence, clampedBase, maxDelta);
-  const effectiveWeight =
-    clampNumber(contextWeight, 0, 1) * clampNumber(remainingWeight, 0, 1);
-  return round1(clampedBase * (1 - effectiveWeight) + clampedContext * effectiveWeight);
 }
 
 export class EmotionEngine {
@@ -210,8 +168,8 @@ export class EmotionEngine {
     const storagePath =
       options.storagePath ?? resolveStoragePath(this.identity);
     this.storage = new EmotionStorage(storagePath, options.baseline);
-    this.baseDecayMs = finiteOr(options.baseDecayMs, BASE_DECAY_MS);
-    this.contextDecayMs = finiteOr(options.contextDecayMs, CONTEXT_DECAY_MS);
+    this.baseDecayMs = finiteOr(options.baseDecayMs, BASE_DECAY_MS, 0);
+    this.contextDecayMs = finiteOr(options.contextDecayMs, CONTEXT_DECAY_MS, 0);
     this.maxGravityDelta = finiteOr(
       options.maxGravityDelta,
       DEFAULT_MAX_GRAVITY_DELTA,
@@ -228,15 +186,18 @@ export class EmotionEngine {
     this.fatigueRecoveryPerHour = finiteOr(
       options.fatigueRecoveryPerHour,
       DEFAULT_FATIGUE_RECOVERY_PER_HOUR,
+      0,
     );
-    this.fatiguePerTurn = finiteOr(options.fatiguePerTurn, DEFAULT_FATIGUE_PER_TURN);
+    this.fatiguePerTurn = finiteOr(options.fatiguePerTurn, DEFAULT_FATIGUE_PER_TURN, 0);
     this.fatiguePerToolCall = finiteOr(
       options.fatiguePerToolCall,
       DEFAULT_FATIGUE_PER_TOOL_CALL,
+      0,
     );
     this.fatiguePerToolError = finiteOr(
       options.fatiguePerToolError,
       DEFAULT_FATIGUE_PER_TOOL_ERROR,
+      0,
     );
     this.maxFatiguePerTurn = finiteOr(
       options.maxFatiguePerTurn,
@@ -300,17 +261,27 @@ export class EmotionEngine {
 
   /**
    * Atomically load state under a cross-process lock, prune expired context,
-   * apply a mutation, persist, and return the resulting blended snapshot.
+   * run a mutator, and persist the updated state.
    */
+  private withMutableState<T>(
+    currentTime: number,
+    fn: (state: EmotionPersistedState) => T,
+  ): T {
+    return this.storage.withLock(() => {
+      const state = this.storage.load(currentTime);
+      this.pruneExpiredContext(state, currentTime);
+      const result = fn(state);
+      this.storage.save(state);
+      return result;
+    });
+  }
+
   private transact(
     currentTime: number,
     mutate: (state: EmotionPersistedState) => void,
   ): BlendedEmotionResult {
-    return this.storage.withLock(() => {
-      const state = this.storage.load(currentTime);
-      this.pruneExpiredContext(state, currentTime);
+    return this.withMutableState(currentTime, (state) => {
       mutate(state);
-      this.storage.save(state);
       return this.computeBlend(state, currentTime);
     });
   }
@@ -355,8 +326,8 @@ export class EmotionEngine {
     if (decayFactor >= 1) {
       return {
         mood: baseline.mood,
-        valence: round1(baseline.valence),
-        energy: round1(baseline.energy),
+        valence: baseline.valence,
+        energy: baseline.energy,
         description: baseline.description,
         updatedAt: base.updatedAt,
         decayProgress: 1,
@@ -365,11 +336,11 @@ export class EmotionEngine {
 
     return {
       mood: base.mood,
-      valence: round1(base.valence + (baseline.valence - base.valence) * decayFactor),
-      energy: round1(base.energy + (baseline.energy - base.energy) * decayFactor),
+      valence: round(base.valence + (baseline.valence - base.valence) * decayFactor, 1),
+      energy: round(base.energy + (baseline.energy - base.energy) * decayFactor, 1),
       description: base.description,
       updatedAt: base.updatedAt,
-      decayProgress: round2(decayFactor),
+      decayProgress: round(decayFactor, 2),
     };
   }
 
@@ -378,13 +349,13 @@ export class EmotionEngine {
    * unrounded remaining weight factor for accurate valence blending.
    */
   private computeDecayedContext(
-    ctx: ContextMoodState | null | undefined,
+    ctx: ContextMoodState | null,
     currentTime: number,
   ): {
     context: NonNullable<BlendedEmotionResult["context"]>;
     remainingFactor: number;
   } | null {
-    if (!ctx || this.isContextExpired(ctx, currentTime)) return null;
+    if (!ctx) return null;
 
     const elapsed = Math.max(0, currentTime - ctx.updatedAt);
     const remainingFactor =
@@ -395,10 +366,10 @@ export class EmotionEngine {
       remainingFactor,
       context: {
         mood: ctx.mood,
-        valence: round1(ctx.valence),
+        valence: ctx.valence,
         trigger: ctx.trigger,
         updatedAt: ctx.updatedAt,
-        remainingWeight: round2(remainingFactor),
+        remainingWeight: round(remainingFactor, 2),
       },
     };
   }
@@ -431,19 +402,17 @@ export class EmotionEngine {
     let rawValence = base.valence;
 
     if (decayedCtx) {
-      const clampedContextValence = clampValenceByGravity(
+      const clampedContext = clampValenceByGravity(
         decayedCtx.context.valence,
         base.valence,
         this.maxGravityDelta,
       );
-      const effectiveWeight = this.contextWeight * decayedCtx.remainingFactor;
-      rawValence =
-        base.valence * (1 - effectiveWeight) +
-        clampedContextValence * effectiveWeight;
+      const weight = this.contextWeight * decayedCtx.remainingFactor;
+      rawValence = base.valence * (1 - weight) + clampedContext * weight;
       blendedMood = decayedCtx.context.mood;
       context = {
         ...decayedCtx.context,
-        valence: clampedContextValence,
+        valence: clampedContext,
       };
     }
 
@@ -452,7 +421,7 @@ export class EmotionEngine {
       context,
       blended: {
         mood: blendedMood,
-        valence: round1(clampNumber(rawValence - valencePenalty, 0, 10)),
+        valence: round(clamp(rawValence - valencePenalty, 0, 10), 1),
         energy: base.energy,
       },
       fatigue,
@@ -483,9 +452,7 @@ export class EmotionEngine {
         ...result.base,
         raw: { ...state.base },
       },
-      context: result.context
-        ? { ...result.context, blendedValence: result.blended.valence }
-        : null,
+      context: result.context,
       blended: result.blended,
       fatigue: {
         ...result.fatigue,
@@ -513,8 +480,8 @@ export class EmotionEngine {
       const decayed = this.computeDecayedBase(state, currentTime);
       state.base = {
         mood: normalizeText(params.mood, decayed.mood),
-        energy: normalizeNumber(params.energy, decayed.energy, 0, 10),
-        valence: normalizeNumber(params.valence, decayed.valence, 0, 10),
+        energy: round(finiteOr(params.energy, decayed.energy, 0, 10), 1),
+        valence: round(finiteOr(params.valence, decayed.valence, 0, 10), 1),
         description: normalizeText(params.description, decayed.description),
         updatedAt: currentTime,
       };
@@ -537,7 +504,7 @@ export class EmotionEngine {
     const currentTime = this.now(nowOverride);
     return this.transact(currentTime, (state) => {
       const decayed = this.computeDecayedBase(state, currentTime);
-      const rawValence = normalizeNumber(params.valence, decayed.valence, 0, 10);
+      const rawValence = round(finiteOr(params.valence, decayed.valence, 0, 10), 1);
 
       state.context = {
         mood: normalizeText(params.mood, "neutral"),
@@ -563,9 +530,9 @@ export class EmotionEngine {
   ): BlendedEmotionResult {
     const currentTime = this.now(nowOverride);
 
-    const turns = finiteOr(workload.turns, 1);
-    const toolCalls = finiteOr(workload.toolCalls, 0);
-    const toolErrors = finiteOr(workload.toolErrors, 0);
+    const turns = finiteOr(workload.turns, 1, 0);
+    const toolCalls = finiteOr(workload.toolCalls, 0, 0);
+    const toolErrors = finiteOr(workload.toolErrors, 0, 0);
     const delta =
       workload.fatigueDelta !== undefined
         ? finiteOr(workload.fatigueDelta, 0, 0, 100)
@@ -589,7 +556,7 @@ export class EmotionEngine {
         this.fatigueRecoveryPerHour,
       );
       state.fatigue = {
-        fatigue: round3(clampNumber(recoveredRaw + delta, 0, 100)),
+        fatigue: round(clamp(recoveredRaw + delta, 0, 100), 3),
         updatedAt: currentTime,
       };
     });
@@ -617,15 +584,6 @@ export class EmotionEngine {
   }
 
   /**
-   * Query current lazily recovered fatigue state (`fatigue_status()`).
-   */
-  getFatigueStatus(nowOverride?: number): BlendedEmotionResult["fatigue"] {
-    const currentTime = this.now(nowOverride);
-    const state = this.storage.load(currentTime);
-    return this.computeEffectiveFatigue(state.fatigue, currentTime);
-  }
-
-  /**
    * Set fatigue value (0–100) directly. Ignores non-finite inputs.
    * Persisted Base Mood energy is left intact because `computeBlend()`
    * applies the fatigue energy cap dynamically, allowing energy to rebound
@@ -641,7 +599,7 @@ export class EmotionEngine {
     }
     return this.transact(currentTime, (state) => {
       state.fatigue = {
-        fatigue: round3(clampNumber(fatigueValue, 0, 100)),
+        fatigue: round(clamp(fatigueValue, 0, 100), 3),
         updatedAt: currentTime,
       };
     });
@@ -655,11 +613,8 @@ export class EmotionEngine {
     nowOverride?: number,
   ): PersonalityBaseline {
     const currentTime = this.now(nowOverride);
-    return this.storage.withLock(() => {
-      const state = this.storage.load(currentTime);
-      this.pruneExpiredContext(state, currentTime);
+    return this.withMutableState(currentTime, (state) => {
       state.baseline = normalizeBaseline(baseline, state.baseline);
-      this.storage.save(state);
       return { ...state.baseline };
     });
   }

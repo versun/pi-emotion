@@ -5,48 +5,89 @@ import {
   EMOTION_TOOL_NAMES,
   refreshUiStatus,
   registerEmotionToolsAndCommands,
-  resolveSessionId,
 } from "./tools.ts";
 import type { EmotionEngineOptions } from "./types.ts";
 
-export * from "./types.ts";
-export * from "./storage.ts";
-export * from "./engine.ts";
-export * from "./prompt.ts";
-export * from "./tools.ts";
+export type {
+  BaseMoodState,
+  BlendedEmotionResult,
+  ContextMoodState,
+  DecayCurve,
+  EmotionEngineOptions,
+  EmotionPersistedState,
+  EmotionSystemStatus,
+  FatigueState,
+  PersonalityBaseline,
+  WorkloadInput,
+} from "./types.ts";
+export {
+  DEFAULT_BASELINE,
+  EmotionStorage,
+  isCustomIdentity,
+  resolveIdentity,
+  resolveStoragePath,
+} from "./storage.ts";
+export {
+  BASE_DECAY_MS,
+  CONTEXT_DECAY_MS,
+  DEFAULT_CONTEXT_WEIGHT,
+  DEFAULT_FATIGUE_PER_TOOL_CALL,
+  DEFAULT_FATIGUE_PER_TOOL_ERROR,
+  DEFAULT_FATIGUE_PER_TURN,
+  DEFAULT_FATIGUE_RECOVERY_PER_HOUR,
+  DEFAULT_HIGH_FATIGUE_VALENCE_THRESHOLD,
+  DEFAULT_MAX_FATIGUE_PER_TURN,
+  DEFAULT_MAX_FATIGUE_VALENCE_PENALTY,
+  DEFAULT_MAX_GRAVITY_DELTA,
+  EmotionEngine,
+  clampValenceByGravity,
+  computeDecayFactor,
+  computeEnergyCapFromFatigue,
+  computeFatigueValencePenalty,
+  computeRecoveredFatigue,
+} from "./engine.ts";
+export {
+  buildEmotionContextBlock,
+  describeEnergyBehavior,
+  describeValenceBehavior,
+  formatEmotionStatusBadge,
+} from "./prompt.ts";
+export { executeCliCommand, tokenizeArgs } from "./tools.ts";
 
 /**
  * Factory to create a configured Pi Emotion & Fatigue Extension.
  *
  * For multi-user isolation on a shared machine / shared OS account, each
- * person sets `PI_EMOTION_USER=<name>` (or has a distinct OS login) and gets
- * a private state file under `~/.pi/agent/emotion-state/users/`.
- * With no custom identity, all sessions share the single legacy file
- * `~/.pi/agent/emotion-state.json`.
+ * identity resolves via `PI_EMOTION_USER` > OS login username > `"default"`
+ * and is stored at `~/.pi/agent/emotion-state/<identity>.json` (or under
+ * `PI_EMOTION_STATE_DIR` / overridden by `PI_EMOTION_STATE_PATH`).
  */
 export function createEmotionExtension(options: EmotionEngineOptions = {}) {
   let engine: EmotionEngine | undefined;
-
-  const engineFor = (): EmotionEngine => (engine ??= new EmotionEngine(options));
+  const getEngine = (): EmotionEngine => (engine ??= new EmotionEngine(options));
 
   const extensionFactory = (pi: ExtensionAPI) => {
+    const eng = getEngine();
+
     // Register AI tools + `/emotion` slash command
-    registerEmotionToolsAndCommands(pi, engineFor);
+    registerEmotionToolsAndCommands(pi, eng);
 
     // Update TUI footer status when a session starts
     pi.on("session_start", async (_event, ctx) => {
-      refreshUiStatus(engineFor(), ctx);
+      refreshUiStatus(eng, ctx);
     });
 
     // Pre-Prompt Hook: lazily evaluate decayed/blended emotion & inject into system prompt
     pi.on("before_agent_start", async (event, ctx) => {
-      const eng = engineFor();
       const state = eng.getBlendedEmotion();
-      const contextBlock = buildEmotionContextBlock(state, resolveSessionId(ctx));
+      const contextBlock = buildEmotionContextBlock(state);
 
       refreshUiStatus(eng, ctx, state);
 
-      if (event.systemPromptOptions?.sections) {
+      if (
+        event.systemPromptOptions?.sections &&
+        event.systemPromptOptions.forceSystemPrompt === undefined
+      ) {
         // Preferred path: patch a prompt section. Pi diffs it and sends only
         // the changed section as a mid-conversation patch, preserving the
         // cached prompt prefix.
@@ -54,8 +95,8 @@ export function createEmotionExtension(options: EmotionEngineOptions = {}) {
         return undefined;
       }
 
-      // Fallback for contexts where prompt sections are unavailable:
-      // append once to the forced system prompt.
+      // Fallback when prompt sections are unavailable or a forced system prompt
+      // is active: append once to the forced system prompt.
       return {
         systemPrompt: `${event.systemPrompt}\n\n${contextBlock}`,
       };
@@ -72,8 +113,6 @@ export function createEmotionExtension(options: EmotionEngineOptions = {}) {
       ) {
         return;
       }
-
-      const eng = engineFor();
 
       // If this turn successfully invoked `rest`, keep fatigue at 0 instead of immediately adding back
       if (toolResults.some((r) => r?.toolName === "rest" && !r.isError)) {
@@ -95,10 +134,9 @@ export function createEmotionExtension(options: EmotionEngineOptions = {}) {
   };
 
   return Object.assign(extensionFactory, {
-    engineFor,
     /** Convenience: the resolved EmotionEngine instance. */
     get engine(): EmotionEngine {
-      return engineFor();
+      return getEngine();
     },
   });
 }

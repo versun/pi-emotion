@@ -1,57 +1,52 @@
 import type { BlendedEmotionResult } from "./types.ts";
 
 interface BehaviorTier {
-  matches: (value: number) => boolean;
   range: string;
   label: string;
   guidance: string;
 }
 
-const VALENCE_TIERS: readonly BehaviorTier[] = [
+const VALENCE_TIERS: readonly [BehaviorTier, BehaviorTier, BehaviorTier] = [
   {
-    matches: (v) => v <= 3,
     range: "valence 0–3",
     label: "low / irritable / aloof",
     guidance: "keep replies brief, less enthusiastic, with occasional dry remarks or sighs.",
   },
   {
-    matches: (v) => v < 7,
     range: "valence 4–6",
     label: "calm / neutral",
     guidance: "communicate naturally with a steady, balanced tone.",
   },
   {
-    matches: () => true,
     range: "valence 7–10",
     label: "happy / warm / excited",
     guidance: "be more expressive, playful, warm, and engaging.",
   },
 ];
 
-const ENERGY_TIERS: readonly BehaviorTier[] = [
+const ENERGY_TIERS: readonly [BehaviorTier, BehaviorTier, BehaviorTier] = [
   {
-    matches: (v) => v <= 3,
     range: "energy 0–3",
     label: "tired / worn out",
     guidance: "use shorter sentences, avoid volunteering extra work, and convey a relaxed/weary vibe.",
   },
   {
-    matches: (v) => v < 7,
     range: "energy 4–6",
     label: "normal energy",
     guidance: "maintain a normal response pace and length.",
   },
   {
-    matches: () => true,
     range: "energy 7–10",
     label: "energetic",
     guidance: "be talkative, proactive, and eager to help.",
   },
 ];
 
-function matchTier(value: number, tiers: readonly BehaviorTier[]): BehaviorTier {
-  if (!Number.isFinite(value)) return tiers[1];
-  return tiers.find((tier) => tier.matches(value)) ?? tiers[1];
+function matchTier(
+  value: number,
+  tiers: readonly [BehaviorTier, BehaviorTier, BehaviorTier],
+): BehaviorTier {
+  return tiers[!Number.isFinite(value) ? 1 : value <= 3 ? 0 : value >= 7 ? 2 : 1];
 }
 
 function formatActiveTier(tier: BehaviorTier): string {
@@ -79,10 +74,7 @@ export function describeEnergyBehavior(energy: number): string {
 /**
  * Generate the Pre-Prompt Hook context block injected before each LLM call.
  */
-export function buildEmotionContextBlock(
-  state: BlendedEmotionResult,
-  sessionId: string = "default",
-): string {
+export function buildEmotionContextBlock(state: BlendedEmotionResult): string {
   const { base, context, blended, fatigue } = state;
 
   const contextSummary = context
@@ -91,7 +83,6 @@ export function buildEmotionContextBlock(
 
   return [
     "### [Emotion & Fatigue Context Block]",
-    `- Session ID: ${sessionId}`,
     `- Base mood: ${base.mood} (valence ${base.valence}/10, energy ${base.energy}/10, description: "${base.description}", 6h decay: ${Math.round(base.decayProgress * 100)}%)`,
     `- Context mood: ${contextSummary}`,
     `- BLENDED: ${blended.mood} (valence ${blended.valence}/10, energy ${blended.energy}/10)`,
