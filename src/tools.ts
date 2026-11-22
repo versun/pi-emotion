@@ -4,6 +4,25 @@ import { formatEmotionStatusBadge } from "./prompt.ts";
 import { isCustomIdentity } from "./storage.ts";
 import type { BlendedEmotionResult } from "./types.ts";
 
+export const EMOTION_TOOL_NAMES = new Set([
+  "emotion_status",
+  "emotion_get",
+  "emotion_set_base",
+  "emotion_set_context",
+  "rest",
+  "fatigue_status",
+]);
+
+const CLI_SUBCOMMANDS = [
+  "status",
+  "get",
+  "set-base",
+  "set-context",
+  "rest",
+  "fatigue",
+  "workload",
+] as const;
+
 function jsonSchema<T extends Record<string, unknown>>(schema: T): any {
   return schema;
 }
@@ -21,19 +40,25 @@ function jsonToolResult<T>(data: T) {
   };
 }
 
-export function resolveChatId(ctx?: Pick<ExtensionContext, "sessionManager">, explicitChatId?: string): string {
-  if (explicitChatId && explicitChatId.trim().length > 0) {
-    return explicitChatId.trim();
+function parseFiniteNumber(value: unknown): number | null {
+  if (typeof value === "number") return Number.isFinite(value) ? value : null;
+  if (typeof value === "string" && value.trim() !== "") {
+    const n = Number(value);
+    return Number.isFinite(n) ? n : null;
   }
-  try {
-    const sessionId = ctx?.sessionManager?.getSessionId?.();
-    if (sessionId && sessionId.trim().length > 0) {
-      return sessionId.trim();
-    }
-  } catch {
-    // Ignore if sessionManager is not bound in test/CLI context
-  }
-  return "default";
+  return null;
+}
+
+function requireFiniteNumber(value: unknown, errorMessage: string): number {
+  const n = parseFiniteNumber(value);
+  if (n === null) throw new Error(errorMessage);
+  return n;
+}
+
+export function resolveSessionId(
+  ctx?: Pick<ExtensionContext, "sessionManager">,
+): string {
+  return ctx?.sessionManager?.getSessionId?.()?.trim() || "default";
 }
 
 export function refreshUiStatus(
@@ -42,13 +67,9 @@ export function refreshUiStatus(
   state?: BlendedEmotionResult,
 ): void {
   if (!ctx?.hasUI) return;
-  try {
-    const blended = state ?? engine.getBlendedEmotion();
-    const persona = isCustomIdentity(engine.identity) ? engine.identity : undefined;
-    ctx.ui.setStatus("pi-emotion", formatEmotionStatusBadge(blended, persona));
-  } catch {
-    // Non-fatal UI status update
-  }
+  const blended = state ?? engine.getBlendedEmotion();
+  const persona = isCustomIdentity(engine.identity) ? engine.identity : undefined;
+  ctx.ui.setStatus("pi-emotion", formatEmotionStatusBadge(blended, persona));
 }
 
 export type EngineResolver = (ctx?: ExtensionContext) => EmotionEngine;
@@ -66,18 +87,19 @@ export function registerEmotionToolsAndCommands(
     typeof engineOrResolver === "function"
       ? engineOrResolver
       : () => engineOrResolver;
+
   // 1. emotion_status
   pi.registerTool({
     name: "emotion_status",
     label: "Emotion Status",
     description:
-      "View current global Base Mood, the shared Context Mood, and Fatigue & Sleep status.",
+      "View current global Base Mood, the shared Context Mood, and workload Fatigue status.",
     promptSnippet: "Inspect global Base mood, the shared Context mood, and Fatigue status",
     parameters: EMPTY_OBJECT_SCHEMA,
     async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
       const engine = engineFor(ctx);
       const status = engine.getStatus();
-      refreshUiStatus(engine, ctx);
+      refreshUiStatus(engine, ctx, status);
       return jsonToolResult(status);
     },
   });
@@ -142,11 +164,9 @@ export function registerEmotionToolsAndCommands(
       _onUpdate,
       ctx,
     ) {
-      const energy = Number(params.energy);
-      const valence = Number(params.valence);
-      if (!Number.isFinite(energy) || !Number.isFinite(valence)) {
-        throw new Error("emotion_set_base: energy and valence must be finite numbers");
-      }
+      const errMsg = "emotion_set_base: energy and valence must be finite numbers";
+      const energy = requireFiniteNumber(params.energy, errMsg);
+      const valence = requireFiniteNumber(params.valence, errMsg);
       const engine = engineFor(ctx);
       const result = engine.setBase({
         mood: params.mood,
@@ -197,10 +217,10 @@ export function registerEmotionToolsAndCommands(
       _onUpdate,
       ctx,
     ) {
-      const valence = Number(params.valence);
-      if (!Number.isFinite(valence)) {
-        throw new Error("emotion_set_context: valence must be a finite number");
-      }
+      const valence = requireFiniteNumber(
+        params.valence,
+        "emotion_set_context: valence must be a finite number",
+      );
       const engine = engineFor(ctx);
       const result = engine.setContext({
         mood: params.mood,
@@ -212,51 +232,16 @@ export function registerEmotionToolsAndCommands(
     },
   });
 
-  // 5a. sleep()
-  pi.registerTool({
-    name: "sleep",
-    label: "Sleep",
-    description:
-      "Enter SLEEPING status and synchronously lower Base Mood energy to <= 1. Must be called in the same turn when saying goodnight or going to sleep.",
-    promptSnippet: "Enter SLEEPING status and lower emotion energy",
-    promptGuidelines: [
-      "When saying you are going to sleep or falling asleep, call sleep in the same turn to keep fatigue status and emotion energy synchronized.",
-    ],
-    parameters: EMPTY_OBJECT_SCHEMA,
-    async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
-      const engine = engineFor(ctx);
-      const result = engine.sleep();
-      refreshUiStatus(engine, ctx, result);
-      return jsonToolResult(result);
-    },
-  });
-
-  // 5b. wake()
-  pi.registerTool({
-    name: "wake",
-    label: "Wake",
-    description:
-      "Wake up from sleep (status -> AWAKE), reduce fatigue, and moderately restore Base Mood energy. Must be called in the same turn when waking up.",
-    promptSnippet: "Wake up (AWAKE), reduce fatigue, and moderately restore emotion energy",
-    promptGuidelines: [
-      "When waking up from sleep, call wake in the same turn to synchronize AWAKE status and restore emotion energy.",
-    ],
-    parameters: EMPTY_OBJECT_SCHEMA,
-    async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
-      const engine = engineFor(ctx);
-      const result = engine.wake();
-      refreshUiStatus(engine, ctx, result);
-      return jsonToolResult(result);
-    },
-  });
-
-  // 5c. rest()
+  // 5. rest()
   pi.registerTool({
     name: "rest",
     label: "Rest",
     description:
-      "Full recovery: reset fatigue to 0, set status to AWAKE, and boost Base Mood energy.",
-    promptSnippet: "Fully recover (fatigue = 0, AWAKE) and boost emotion energy",
+      "Full recovery: reset workload fatigue to 0 and boost Base Mood energy.",
+    promptSnippet: "Fully recover (fatigue = 0) and boost emotion energy",
+    promptGuidelines: [
+      "Only call rest when the user explicitly invites you to take a break or reset fatigue; do not self-reset workload fatigue on your own.",
+    ],
     parameters: EMPTY_OBJECT_SCHEMA,
     async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
       const engine = engineFor(ctx);
@@ -266,46 +251,36 @@ export function registerEmotionToolsAndCommands(
     },
   });
 
-  // 5d. fatigue_status()
+  // 6. fatigue_status()
   pi.registerTool({
     name: "fatigue_status",
     label: "Fatigue Status",
-    description: "Query current fatigue value (0-100), sleep status (AWAKE/SLEEPING), and energy cap.",
-    promptSnippet: "Query current fatigue level and sleep status",
+    description:
+      "Query current workload fatigue (0-100, passively recovers over idle time) and energy cap.",
+    promptSnippet: "Query current workload fatigue level and energy cap",
     parameters: EMPTY_OBJECT_SCHEMA,
     async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
       const engine = engineFor(ctx);
-      const fatigue = engine.getFatigueStatus();
-      refreshUiStatus(engine, ctx);
-      return jsonToolResult(fatigue);
+      const blended = engine.getBlendedEmotion();
+      refreshUiStatus(engine, ctx, blended);
+      return jsonToolResult(blended.fatigue);
     },
   });
 
   // Register `/emotion` slash command for interactive CLI / TUI use
   pi.registerCommand("emotion", {
-    description:
-      "Manage Emotion & Fatigue System: /emotion <status|get|set-base|set-context|sleep|wake|rest|fatigue>",
+    description: `Manage Emotion & Fatigue System: /emotion <${CLI_SUBCOMMANDS.join("|")}>`,
     getArgumentCompletions: (prefix) => {
-      const subcommands = [
-        "status",
-        "get",
-        "set-base",
-        "set-context",
-        "sleep",
-        "wake",
-        "rest",
-        "fatigue",
-      ];
-      const matches = subcommands.filter((s) => s.startsWith(prefix));
+      const matches = CLI_SUBCOMMANDS.filter((s) => s.startsWith(prefix));
       return matches.length > 0 ? matches.map((s) => ({ value: s, label: s })) : null;
     },
     handler: async (args, ctx) => {
       const engine = engineFor(ctx);
       try {
-        const output = executeCliCommand(engine, tokenizeArgs(args));
-        refreshUiStatus(engine, ctx);
+        const { data, blended } = runCliCommand(engine, tokenizeArgs(args));
+        refreshUiStatus(engine, ctx, blended);
         if (ctx.hasUI) {
-          ctx.ui.notify(output, "info");
+          ctx.ui.notify(JSON.stringify(data, null, 2), "info");
         }
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
@@ -332,24 +307,23 @@ export function tokenizeArgs(input: string): string[] {
   return tokens;
 }
 
-/**
- * Shared CLI command dispatcher for both `/emotion` slash command and `bin/emotion.ts`.
- */
-export function executeCliCommand(
+function runCliCommand(
   engine: EmotionEngine,
   argv: string[],
-): string {
+): { data: unknown; blended?: BlendedEmotionResult } {
   const [sub = "status", ...rest] = argv;
 
   switch (sub) {
     case "status":
     case "emotion_status": {
-      return JSON.stringify(engine.getStatus(), null, 2);
+      const status = engine.getStatus();
+      return { data: status, blended: status };
     }
 
     case "get":
     case "emotion_get": {
-      return JSON.stringify(engine.getBlendedEmotion(), null, 2);
+      const blended = engine.getBlendedEmotion();
+      return { data: blended, blended };
     }
 
     case "set-base":
@@ -360,20 +334,15 @@ export function executeCliCommand(
         );
       }
       const [mood, energyStr, valenceStr, ...descParts] = rest;
-      const energy = Number(energyStr);
-      const valence = Number(valenceStr);
-      if (!Number.isFinite(energy) || !Number.isFinite(valence)) {
-        throw new Error(
-          "Usage: emotion set-base <mood> <energy:0-10> <valence:0-10> <description> — energy and valence must be numbers",
-        );
-      }
-      const result = engine.setBase({
+      const errMsg =
+        "Usage: emotion set-base <mood> <energy:0-10> <valence:0-10> <description> — energy and valence must be numbers";
+      const blended = engine.setBase({
         mood,
-        energy,
-        valence,
+        energy: requireFiniteNumber(energyStr, errMsg),
+        valence: requireFiniteNumber(valenceStr, errMsg),
         description: descParts.join(" "),
       });
-      return JSON.stringify(result, null, 2);
+      return { data: blended, blended };
     }
 
     case "set-context":
@@ -384,48 +353,68 @@ export function executeCliCommand(
         );
       }
       const [mood, valenceStr, ...triggerParts] = rest;
-      const valence = Number(valenceStr);
-      if (!Number.isFinite(valence)) {
-        throw new Error(
-          "Usage: emotion set-context <mood> <valence:0-10> <trigger> — valence must be a number",
-        );
-      }
-      const result = engine.setContext({
+      const valence = requireFiniteNumber(
+        valenceStr,
+        "Usage: emotion set-context <mood> <valence:0-10> <trigger> — valence must be a number",
+      );
+      const blended = engine.setContext({
         mood,
         valence,
         trigger: triggerParts.join(" "),
       });
-      return JSON.stringify(result, null, 2);
-    }
-
-    case "sleep": {
-      return JSON.stringify(engine.sleep(), null, 2);
-    }
-
-    case "wake": {
-      return JSON.stringify(engine.wake(), null, 2);
+      return { data: blended, blended };
     }
 
     case "rest": {
-      return JSON.stringify(engine.rest(), null, 2);
+      const blended = engine.rest();
+      return { data: blended, blended };
+    }
+
+    case "workload": {
+      const errMsg =
+        "Usage: emotion workload [turns=1] [toolCalls=0] [toolErrors=0] — values must be numbers (>= 0)";
+      const parseNonNeg = (raw: string | undefined, fallback: number) => {
+        if (raw === undefined) return fallback;
+        const n = requireFiniteNumber(raw, errMsg);
+        if (n < 0) throw new Error(errMsg);
+        return n;
+      };
+      const blended = engine.recordWorkload({
+        turns: parseNonNeg(rest[0], 1),
+        toolCalls: parseNonNeg(rest[1], 0),
+        toolErrors: parseNonNeg(rest[2], 0),
+      });
+      return { data: blended, blended };
     }
 
     case "fatigue":
     case "fatigue-status":
     case "fatigue_status": {
       if (rest[0] === undefined) {
-        return JSON.stringify(engine.getFatigueStatus(), null, 2);
+        const blended = engine.getBlendedEmotion();
+        return { data: blended.fatigue, blended };
       }
-      const value = Number(rest[0]);
-      if (!Number.isFinite(value)) {
-        throw new Error("Usage: emotion fatigue [0-100] — value must be a number");
-      }
-      return JSON.stringify(engine.setFatigue(value), null, 2);
+      const value = requireFiniteNumber(
+        rest[0],
+        "Usage: emotion fatigue [0-100] — value must be a number",
+      );
+      const blended = engine.setFatigue(value);
+      return { data: blended, blended };
     }
 
     default:
       throw new Error(
-        `Unknown emotion command "${sub}". Supported: status, get, set-base, set-context, sleep, wake, rest, fatigue`,
+        `Unknown emotion command "${sub}". Supported: ${CLI_SUBCOMMANDS.join(", ")}`,
       );
   }
+}
+
+/**
+ * Shared CLI command dispatcher for both `/emotion` slash command and `bin/emotion.ts`.
+ */
+export function executeCliCommand(
+  engine: EmotionEngine,
+  argv: string[],
+): string {
+  return JSON.stringify(runCliCommand(engine, argv).data, null, 2);
 }

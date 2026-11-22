@@ -1,12 +1,14 @@
 import {
   clampNumber,
   EmotionStorage,
+  normalizeBaseline,
   normalizeNumber,
   normalizeText,
   resolveIdentity,
   resolveStoragePath,
   round1,
   round2,
+  round3,
 } from "./storage.ts";
 import type {
   BlendedEmotionResult,
@@ -17,6 +19,7 @@ import type {
   EmotionSystemStatus,
   FatigueState,
   PersonalityBaseline,
+  WorkloadInput,
 } from "./types.ts";
 
 /** 6 hours in milliseconds */
@@ -30,6 +33,38 @@ export const DEFAULT_MAX_GRAVITY_DELTA = 4.0;
 
 /** Default pull weight of a fresh Context Mood against Base Mood at t=0 */
 export const DEFAULT_CONTEXT_WEIGHT = 0.65;
+
+/** Default passive idle fatigue recovery rate (points per hour) */
+export const DEFAULT_FATIGUE_RECOVERY_PER_HOUR = 15;
+
+/** Default fatigue added per completed agent turn */
+export const DEFAULT_FATIGUE_PER_TURN = 2.0;
+
+/** Default additional fatigue per non-passive tool call */
+export const DEFAULT_FATIGUE_PER_TOOL_CALL = 0.5;
+
+/** Default additional fatigue per failed tool call */
+export const DEFAULT_FATIGUE_PER_TOOL_ERROR = 1.0;
+
+/** Default cap on fatigue added by a single workload event */
+export const DEFAULT_MAX_FATIGUE_PER_TURN = 12.0;
+
+/** Fatigue threshold above which exhaustion begins weighing down blended valence */
+export const DEFAULT_HIGH_FATIGUE_VALENCE_THRESHOLD = 60;
+
+/** Maximum valence drag applied at 100 fatigue */
+export const DEFAULT_MAX_FATIGUE_VALENCE_PENALTY = 1.5;
+
+function finiteOr(
+  value: number | undefined,
+  fallback: number,
+  min: number = 0,
+  max: number = Number.POSITIVE_INFINITY,
+): number {
+  return typeof value === "number" && Number.isFinite(value)
+    ? clampNumber(value, min, max)
+    : fallback;
+}
 
 /**
  * Compute normalized interpolation progress [0, 1] over a decay window.
@@ -52,18 +87,36 @@ export function computeDecayFactor(
   return linear;
 }
 
-/**
- * Compute maximum sustainable energy (0–10) allowed by current Fatigue & Sleep status.
- * - SLEEPING => capped at 1.0
- * - AWAKE    => linearly scales from 10.0 (at fatigue 0) down to 1.0 (at fatigue 100)
- */
-export function computeEnergyCapFromFatigue(
-  fatigue: Pick<FatigueState, "status" | "fatigue">,
+function computeRawRecoveredFatigue(
+  rawFatigue: number,
+  elapsedMs: number,
+  recoveryPerHour: number = DEFAULT_FATIGUE_RECOVERY_PER_HOUR,
 ): number {
-  if (fatigue.status === "SLEEPING") {
-    return 1.0;
+  const start = clampNumber(rawFatigue, 0, 100);
+  if (start <= 0 || elapsedMs <= 0 || recoveryPerHour <= 0) {
+    return start;
   }
-  const f = clampNumber(fatigue.fatigue, 0, 100);
+  const elapsedHours = elapsedMs / (60 * 60 * 1000);
+  return clampNumber(start - elapsedHours * recoveryPerHour, 0, 100);
+}
+
+/**
+ * Compute lazily recovered fatigue [0, 100] after `elapsedMs` of idle time.
+ */
+export function computeRecoveredFatigue(
+  rawFatigue: number,
+  elapsedMs: number,
+  recoveryPerHour: number = DEFAULT_FATIGUE_RECOVERY_PER_HOUR,
+): number {
+  return round1(computeRawRecoveredFatigue(rawFatigue, elapsedMs, recoveryPerHour));
+}
+
+/**
+ * Compute maximum sustainable energy (0–10) allowed by current Fatigue.
+ * Linearly scales from 10.0 (at fatigue 0) down to 1.0 (at fatigue 100).
+ */
+export function computeEnergyCapFromFatigue(fatigueValue: number): number {
+  const f = clampNumber(fatigueValue, 0, 100);
   return round1(10 - (f / 100) * 9);
 }
 
@@ -72,14 +125,31 @@ export function computeEnergyCapFromFatigue(
  */
 export function computeEffectiveEnergy(
   rawEnergy: number,
-  fatigue: Pick<FatigueState, "status" | "fatigue">,
+  fatigueValue: number,
 ): number {
-  const cap = computeEnergyCapFromFatigue(fatigue);
+  const cap = computeEnergyCapFromFatigue(fatigueValue);
   return round1(clampNumber(Math.min(rawEnergy, cap), 0, 10));
 }
 
 /**
- * Emotional Gravity Clamping Function (引力夹逼函数):
+ * Compute valence drag caused by high fatigue (returns unrounded penalty >= 0).
+ * Below `threshold`, fatigue does not weigh on valence; above `threshold`,
+ * it scales linearly up to `maxPenalty` at fatigue = 100.
+ */
+export function computeFatigueValencePenalty(
+  fatigueValue: number,
+  threshold: number = DEFAULT_HIGH_FATIGUE_VALENCE_THRESHOLD,
+  maxPenalty: number = DEFAULT_MAX_FATIGUE_VALENCE_PENALTY,
+): number {
+  const f = clampNumber(fatigueValue, 0, 100);
+  const t = clampNumber(threshold, 0, 100);
+  const penalty = Math.max(0, maxPenalty);
+  if (t >= 100 || f <= t || penalty <= 0) return 0;
+  return ((f - t) / (100 - t)) * penalty;
+}
+
+/**
+ * Emotional Gravity Clamping Function:
  * Anchors a target Context valence around the active Base valence within `[-maxDelta, +maxDelta]`,
  * preventing extreme single-turn mood whiplash (e.g., jumping from valence 1 to 10 on one compliment).
  */
@@ -91,13 +161,17 @@ export function clampValenceByGravity(
   const clampedTarget = clampNumber(targetValence, 0, 10);
   const clampedBase = clampNumber(baseValence, 0, 10);
   const delta = Math.max(0, maxDelta);
-  const minAllowed = Math.max(0, clampedBase - delta);
-  const maxAllowed = Math.min(10, clampedBase + delta);
-  return round1(clampNumber(clampedTarget, minAllowed, maxAllowed));
+  return round1(
+    clampNumber(
+      clampedTarget,
+      Math.max(0, clampedBase - delta),
+      Math.min(10, clampedBase + delta),
+    ),
+  );
 }
 
 /**
- * Emotional Gravity Blending Function (引力加权融合):
+ * Emotional Gravity Blending Function:
  * Combines Base valence and gravity-clamped Context valence, weighted by Context's remaining freshness.
  */
 export function blendValenceWithGravity(
@@ -107,9 +181,11 @@ export function blendValenceWithGravity(
   contextWeight: number = DEFAULT_CONTEXT_WEIGHT,
   maxDelta: number = DEFAULT_MAX_GRAVITY_DELTA,
 ): number {
-  const clampedContext = clampValenceByGravity(contextValence, baseValence, maxDelta);
-  const effectiveWeight = clampNumber(contextWeight, 0, 1) * clampNumber(remainingWeight, 0, 1);
-  return round1(baseValence * (1 - effectiveWeight) + clampedContext * effectiveWeight);
+  const clampedBase = clampNumber(baseValence, 0, 10);
+  const clampedContext = clampValenceByGravity(contextValence, clampedBase, maxDelta);
+  const effectiveWeight =
+    clampNumber(contextWeight, 0, 1) * clampNumber(remainingWeight, 0, 1);
+  return round1(clampedBase * (1 - effectiveWeight) + clampedContext * effectiveWeight);
 }
 
 export class EmotionEngine {
@@ -120,6 +196,13 @@ export class EmotionEngine {
   readonly maxGravityDelta: number;
   readonly contextWeight: number;
   readonly decayCurve: DecayCurve;
+  readonly fatigueRecoveryPerHour: number;
+  readonly fatiguePerTurn: number;
+  readonly fatiguePerToolCall: number;
+  readonly fatiguePerToolError: number;
+  readonly maxFatiguePerTurn: number;
+  readonly highFatigueValenceThreshold: number;
+  readonly maxFatigueValencePenalty: number;
   private readonly clock: () => number;
 
   constructor(options: EmotionEngineOptions = {}) {
@@ -127,11 +210,52 @@ export class EmotionEngine {
     const storagePath =
       options.storagePath ?? resolveStoragePath(this.identity);
     this.storage = new EmotionStorage(storagePath, options.baseline);
-    this.baseDecayMs = options.baseDecayMs ?? BASE_DECAY_MS;
-    this.contextDecayMs = options.contextDecayMs ?? CONTEXT_DECAY_MS;
-    this.maxGravityDelta = options.maxGravityDelta ?? DEFAULT_MAX_GRAVITY_DELTA;
-    this.contextWeight = options.contextWeight ?? DEFAULT_CONTEXT_WEIGHT;
-    this.decayCurve = options.decayCurve ?? "linear";
+    this.baseDecayMs = finiteOr(options.baseDecayMs, BASE_DECAY_MS);
+    this.contextDecayMs = finiteOr(options.contextDecayMs, CONTEXT_DECAY_MS);
+    this.maxGravityDelta = finiteOr(
+      options.maxGravityDelta,
+      DEFAULT_MAX_GRAVITY_DELTA,
+      0,
+      10,
+    );
+    this.contextWeight = finiteOr(
+      options.contextWeight,
+      DEFAULT_CONTEXT_WEIGHT,
+      0,
+      1,
+    );
+    this.decayCurve = options.decayCurve === "exponential" ? "exponential" : "linear";
+    this.fatigueRecoveryPerHour = finiteOr(
+      options.fatigueRecoveryPerHour,
+      DEFAULT_FATIGUE_RECOVERY_PER_HOUR,
+    );
+    this.fatiguePerTurn = finiteOr(options.fatiguePerTurn, DEFAULT_FATIGUE_PER_TURN);
+    this.fatiguePerToolCall = finiteOr(
+      options.fatiguePerToolCall,
+      DEFAULT_FATIGUE_PER_TOOL_CALL,
+    );
+    this.fatiguePerToolError = finiteOr(
+      options.fatiguePerToolError,
+      DEFAULT_FATIGUE_PER_TOOL_ERROR,
+    );
+    this.maxFatiguePerTurn = finiteOr(
+      options.maxFatiguePerTurn,
+      DEFAULT_MAX_FATIGUE_PER_TURN,
+      0,
+      100,
+    );
+    this.highFatigueValenceThreshold = finiteOr(
+      options.highFatigueValenceThreshold,
+      DEFAULT_HIGH_FATIGUE_VALENCE_THRESHOLD,
+      0,
+      100,
+    );
+    this.maxFatigueValencePenalty = finiteOr(
+      options.maxFatigueValencePenalty,
+      DEFAULT_MAX_FATIGUE_VALENCE_PENALTY,
+      0,
+      10,
+    );
     this.clock = options.now ?? (() => Date.now());
   }
 
@@ -141,40 +265,84 @@ export class EmotionEngine {
       : this.clock();
   }
 
+  private isContextExpired(ctx: ContextMoodState, currentTime: number): boolean {
+    return Math.max(0, currentTime - ctx.updatedAt) >= this.contextDecayMs;
+  }
+
+  private pruneExpiredContext(
+    state: EmotionPersistedState,
+    currentTime: number,
+  ): boolean {
+    if (state.context && this.isContextExpired(state.context, currentTime)) {
+      state.context = null;
+      return true;
+    }
+    return false;
+  }
+
   /**
-   * Load persisted state, lazily pruning an expired shared Context Mood on disk.
+   * Load persisted state, lazily pruning an expired shared Context Mood on disk
+   * under the storage lock so concurrent writes are never clobbered.
    */
   private loadState(currentTime: number): EmotionPersistedState {
     const state = this.storage.load(currentTime);
-    if (this.pruneExpiredContext(state, currentTime)) {
-      this.storage.save(state);
+    if (state.context && this.isContextExpired(state.context, currentTime)) {
+      return this.storage.withLock(() => {
+        const fresh = this.storage.load(currentTime);
+        if (this.pruneExpiredContext(fresh, currentTime)) {
+          this.storage.save(fresh);
+        }
+        return fresh;
+      });
     }
     return state;
   }
 
   /**
-   * Load state, apply a mutation, persist (unless mutator returns `false` for a no-op),
-   * and return the resulting blended snapshot without a redundant reload.
+   * Atomically load state under a cross-process lock, prune expired context,
+   * apply a mutation, persist, and return the resulting blended snapshot.
    */
   private transact(
     currentTime: number,
-    mutate: (state: EmotionPersistedState) => boolean | void,
+    mutate: (state: EmotionPersistedState) => void,
   ): BlendedEmotionResult {
-    const state = this.loadState(currentTime);
-    if (mutate(state) !== false) {
+    return this.storage.withLock(() => {
+      const state = this.storage.load(currentTime);
+      this.pruneExpiredContext(state, currentTime);
+      mutate(state);
       this.storage.save(state);
-    }
-    return this.computeBlend(state, currentTime);
+      return this.computeBlend(state, currentTime);
+    });
   }
 
   /**
-   * Compute decayed Base Mood at `currentTime` without mutating disk unless requested.
+   * Compute lazily recovered fatigue and derived energy cap at `currentTime`.
+   */
+  private computeEffectiveFatigue(
+    fatigue: FatigueState,
+    currentTime: number,
+  ): BlendedEmotionResult["fatigue"] {
+    const elapsed = Math.max(0, currentTime - fatigue.updatedAt);
+    const value = computeRecoveredFatigue(
+      fatigue.fatigue,
+      elapsed,
+      this.fatigueRecoveryPerHour,
+    );
+    return {
+      value,
+      energyCap: computeEnergyCapFromFatigue(value),
+      updatedAt: fatigue.updatedAt,
+    };
+  }
+
+  /**
+   * Compute lazily decayed Base Mood values before applying the fatigue energy cap.
    */
   private computeDecayedBase(
     state: EmotionPersistedState,
     currentTime: number,
   ): BlendedEmotionResult["base"] {
-    const { base, baseline, fatigue } = state;
+    const { base, baseline } = state;
     const elapsed = Math.max(0, currentTime - base.updatedAt);
     // Keep the unrounded factor for the boundary comparison: rounding first
     // would trigger full revert up to ~40min early under the exponential curve.
@@ -183,147 +351,108 @@ export class EmotionEngine {
       this.baseDecayMs,
       this.decayCurve,
     );
-    const decayProgress = round2(decayFactor);
-    const sleeping = fatigue.status === "SLEEPING";
 
     if (decayFactor >= 1) {
       return {
-        mood: sleeping ? "sleepy" : baseline.mood,
+        mood: baseline.mood,
         valence: round1(baseline.valence),
-        energy: computeEffectiveEnergy(baseline.energy, fatigue),
+        energy: round1(baseline.energy),
         description: baseline.description,
         updatedAt: base.updatedAt,
         decayProgress: 1,
       };
     }
 
-    // Interpolate with the unrounded factor so valence/energy cannot fully
-    // revert while the boundary check still keeps the mood label — keeps
-    // compute and display consistent in the tail of the decay window.
-    const decayedValence = round1(
-      base.valence + (baseline.valence - base.valence) * decayFactor,
-    );
-    const decayedRawEnergy = round1(
-      base.energy + (baseline.energy - base.energy) * decayFactor,
-    );
-
     return {
-      mood: sleeping ? "sleepy" : base.mood,
-      valence: decayedValence,
-      energy: computeEffectiveEnergy(decayedRawEnergy, fatigue),
+      mood: base.mood,
+      valence: round1(base.valence + (baseline.valence - base.valence) * decayFactor),
+      energy: round1(base.energy + (baseline.energy - base.energy) * decayFactor),
       description: base.description,
       updatedAt: base.updatedAt,
-      decayProgress,
+      decayProgress: round2(decayFactor),
     };
   }
 
-  private isContextExpired(ctx: ContextMoodState, currentTime: number): boolean {
-    const elapsed = Math.max(0, currentTime - ctx.updatedAt);
-    return elapsed >= this.contextDecayMs;
-  }
-
   /**
-   * Compute decayed shared Context Mood at `currentTime`.
-   * Returns `null` if missing or past the context decay window.
+   * Compute decayed shared Context Mood at `currentTime`, along with its
+   * unrounded remaining weight factor for accurate valence blending.
    */
   private computeDecayedContext(
     ctx: ContextMoodState | null | undefined,
     currentTime: number,
-  ): BlendedEmotionResult["context"] {
+  ): {
+    context: NonNullable<BlendedEmotionResult["context"]>;
+    remainingFactor: number;
+  } | null {
     if (!ctx || this.isContextExpired(ctx, currentTime)) return null;
+
     const elapsed = Math.max(0, currentTime - ctx.updatedAt);
     const remainingFactor =
       1 - computeDecayFactor(elapsed, this.contextDecayMs, this.decayCurve);
-    // Compare on the unrounded factor so near-expiry contexts are not dropped
-    // early just because their remaining weight rounds to 0.00.
-    if (remainingFactor <= 0) {
-      return null;
-    }
-    const remainingWeight = round2(remainingFactor);
+    if (remainingFactor <= 0) return null;
 
     return {
-      mood: ctx.mood,
-      valence: round1(ctx.valence),
-      trigger: ctx.trigger,
-      updatedAt: ctx.updatedAt,
-      remainingWeight,
-    };
-  }
-
-  /**
-   * Clear the expired shared Context Mood in-place before saving.
-   */
-  private pruneExpiredContext(state: EmotionPersistedState, currentTime: number): boolean {
-    if (state.context && this.isContextExpired(state.context, currentTime)) {
-      state.context = null;
-      return true;
-    }
-    return false;
-  }
-
-  private static fatigueResult(
-    fatigue: FatigueState,
-  ): BlendedEmotionResult["fatigue"] {
-    return {
-      status: fatigue.status,
-      value: round1(fatigue.fatigue),
-      energyCap: computeEnergyCapFromFatigue(fatigue),
-      updatedAt: fatigue.updatedAt,
+      remainingFactor,
+      context: {
+        mood: ctx.mood,
+        valence: round1(ctx.valence),
+        trigger: ctx.trigger,
+        updatedAt: ctx.updatedAt,
+        remainingWeight: round2(remainingFactor),
+      },
     };
   }
 
   /**
    * Compute the blended emotion snapshot for an already-loaded state:
-   * lazy Base decay, shared-Context expiration/decay, Emotional Gravity
-   * clamping & weighted blending, and Fatigue-to-Energy constraints.
+   * lazy idle Fatigue recovery, lazy Base decay, shared-Context expiration/decay,
+   * Emotional Gravity clamping & weighted blending, Fatigue-to-Energy cap,
+   * and high-fatigue valence drag.
    */
   private computeBlend(
     state: EmotionPersistedState,
     currentTime: number,
   ): BlendedEmotionResult {
-    const base = this.computeDecayedBase(state, currentTime);
-    const context = this.computeDecayedContext(state.context, currentTime);
-    const fatigue = EmotionEngine.fatigueResult(state.fatigue);
+    const fatigue = this.computeEffectiveFatigue(state.fatigue, currentTime);
+    const rawBase = this.computeDecayedBase(state, currentTime);
+    const base: BlendedEmotionResult["base"] = {
+      ...rawBase,
+      energy: Math.min(rawBase.energy, fatigue.energyCap),
+    };
+    const decayedCtx = this.computeDecayedContext(state.context, currentTime);
+    const valencePenalty = computeFatigueValencePenalty(
+      fatigue.value,
+      this.highFatigueValenceThreshold,
+      this.maxFatigueValencePenalty,
+    );
 
-    if (!context) {
-      return {
-        base,
-        context: null,
-        blended: {
-          mood: base.mood,
-          valence: base.valence,
-          energy: base.energy,
-        },
-        fatigue,
+    let context: BlendedEmotionResult["context"] = null;
+    let blendedMood = base.mood;
+    let rawValence = base.valence;
+
+    if (decayedCtx) {
+      const clampedContextValence = clampValenceByGravity(
+        decayedCtx.context.valence,
+        base.valence,
+        this.maxGravityDelta,
+      );
+      const effectiveWeight = this.contextWeight * decayedCtx.remainingFactor;
+      rawValence =
+        base.valence * (1 - effectiveWeight) +
+        clampedContextValence * effectiveWeight;
+      blendedMood = decayedCtx.context.mood;
+      context = {
+        ...decayedCtx.context,
+        valence: clampedContextValence,
       };
     }
 
-    // Apply Emotional Gravity to both context.valence and blended.valence
-    const gravityClampedContextValence = clampValenceByGravity(
-      context.valence,
-      base.valence,
-      this.maxGravityDelta,
-    );
-    const blendedValence = blendValenceWithGravity(
-      base.valence,
-      gravityClampedContextValence,
-      context.remainingWeight,
-      this.contextWeight,
-      this.maxGravityDelta,
-    );
-
-    // If sleeping, sleep overrides active mood label; otherwise adopt active Context mood
-    const blendedMood = state.fatigue.status === "SLEEPING" ? "sleepy" : context.mood;
-
     return {
       base,
-      context: {
-        ...context,
-        valence: gravityClampedContextValence,
-      },
+      context,
       blended: {
         mood: blendedMood,
-        valence: blendedValence,
+        valence: round1(clampNumber(rawValence - valencePenalty, 0, 10)),
         energy: base.energy,
       },
       fatigue,
@@ -331,9 +460,7 @@ export class EmotionEngine {
   }
 
   /**
-   * Core read-time computation (`getBlendedEmotion()`):
-   * Applies lazy 6h Base decay, lazy 2h shared-Context expiration/decay,
-   * Emotional Gravity clamping & weighted blending, and Fatigue-to-Energy constraints.
+   * Core read-time computation (`getBlendedEmotion()`).
    */
   getBlendedEmotion(nowOverride?: number): BlendedEmotionResult {
     const currentTime = this.now(nowOverride);
@@ -341,7 +468,7 @@ export class EmotionEngine {
   }
 
   /**
-   * Return global status across Base Mood, the shared Context Mood, and Fatigue.
+   * Return global status across Base Mood, shared Context Mood, Blended state, and Fatigue.
    */
   getStatus(nowOverride?: number): EmotionSystemStatus {
     const currentTime = this.now(nowOverride);
@@ -359,13 +486,18 @@ export class EmotionEngine {
       context: result.context
         ? { ...result.context, blendedValence: result.blended.valence }
         : null,
-      fatigue: result.fatigue,
+      blended: result.blended,
+      fatigue: {
+        ...result.fatigue,
+        raw: { ...state.fatigue },
+      },
     };
   }
 
   /**
    * Update global Base Mood (`emotion_set_base`).
-   * Energy is automatically constrained by current Fatigue / Sleep status.
+   * Raw energy is stored intact while effective energy is dynamically capped by
+   * current recovered Fatigue on read, allowing energy to rebound as fatigue clears.
    */
   setBase(
     params: {
@@ -378,14 +510,12 @@ export class EmotionEngine {
   ): BlendedEmotionResult {
     const currentTime = this.now(nowOverride);
     return this.transact(currentTime, (state) => {
-      const requestedEnergy = round1(clampNumber(params.energy, 0, 10));
-      const constrainedEnergy = computeEffectiveEnergy(requestedEnergy, state.fatigue);
-
+      const decayed = this.computeDecayedBase(state, currentTime);
       state.base = {
-        mood: normalizeText(params.mood, state.baseline.mood),
-        energy: constrainedEnergy,
-        valence: round1(clampNumber(params.valence, 0, 10)),
-        description: normalizeText(params.description, state.baseline.description),
+        mood: normalizeText(params.mood, decayed.mood),
+        energy: normalizeNumber(params.energy, decayed.energy, 0, 10),
+        valence: normalizeNumber(params.valence, decayed.valence, 0, 10),
+        description: normalizeText(params.description, decayed.description),
         updatedAt: currentTime,
       };
     });
@@ -406,16 +536,16 @@ export class EmotionEngine {
   ): BlendedEmotionResult {
     const currentTime = this.now(nowOverride);
     return this.transact(currentTime, (state) => {
-      const decayedBase = this.computeDecayedBase(state, currentTime);
-      const clampedValence = clampValenceByGravity(
-        round1(clampNumber(params.valence, 0, 10)),
-        decayedBase.valence,
-        this.maxGravityDelta,
-      );
+      const decayed = this.computeDecayedBase(state, currentTime);
+      const rawValence = normalizeNumber(params.valence, decayed.valence, 0, 10);
 
       state.context = {
         mood: normalizeText(params.mood, "neutral"),
-        valence: clampedValence,
+        valence: clampValenceByGravity(
+          rawValence,
+          decayed.valence,
+          this.maxGravityDelta,
+        ),
         trigger: normalizeText(params.trigger, "conversation shift"),
         updatedAt: currentTime,
       };
@@ -423,81 +553,43 @@ export class EmotionEngine {
   }
 
   /**
-   * Enter sleep state (`sleep()`):
-   * - Sets fatigue.status = "SLEEPING"
-   * - Synchronously lowers Base Mood energy to <= 1 and updates mood to "sleepy"
-   * - Re-sleeping preserves the original sleep start so `wake()` recovery
-   *   still counts the full sleep duration.
+   * Accumulate workload fatigue after a completed turn / tool batch.
+   * First applies unrounded lazy idle recovery up to `currentTime` so rest
+   * between turns is never lost or double-rounded, then adds capped workload fatigue.
    */
-  sleep(nowOverride?: number): BlendedEmotionResult {
+  recordWorkload(
+    workload: WorkloadInput = {},
+    nowOverride?: number,
+  ): BlendedEmotionResult {
     const currentTime = this.now(nowOverride);
+
+    const turns = finiteOr(workload.turns, 1);
+    const toolCalls = finiteOr(workload.toolCalls, 0);
+    const toolErrors = finiteOr(workload.toolErrors, 0);
+    const delta =
+      workload.fatigueDelta !== undefined
+        ? finiteOr(workload.fatigueDelta, 0, 0, 100)
+        : Math.min(
+            100,
+            this.maxFatiguePerTurn * Math.max(1, turns),
+            turns * this.fatiguePerTurn +
+              toolCalls * this.fatiguePerToolCall +
+              toolErrors * this.fatiguePerToolError,
+          );
+
+    if (delta <= 0) {
+      return this.getBlendedEmotion(currentTime);
+    }
+
     return this.transact(currentTime, (state) => {
-      const alreadySleeping = state.fatigue.status === "SLEEPING";
-      if (alreadySleeping && state.base.mood === "sleepy" && state.base.energy <= 1) {
-        return false;
-      }
-
-      const decayedBase = this.computeDecayedBase(state, currentTime);
-
-      state.fatigue = {
-        status: "SLEEPING",
-        fatigue: round1(clampNumber(state.fatigue.fatigue, 0, 100)),
-        updatedAt: alreadySleeping ? state.fatigue.updatedAt : currentTime,
-      };
-
-      state.base = {
-        mood: "sleepy",
-        energy: round1(Math.min(decayedBase.energy, 1)),
-        valence: decayedBase.valence,
-        description: "sleeping, drowsy, low responsiveness",
-        updatedAt: currentTime,
-      };
-    });
-  }
-
-  /**
-   * Wake up from sleep (`wake()`):
-   * - No-op while already AWAKE (prevents farming fatigue recovery)
-   * - Reduces fatigue based on sleep duration (minimum 40 points recovery)
-   * - Synchronously restores Base Mood energy to a moderate waking level bounded by remaining fatigue
-   */
-  wake(nowOverride?: number): BlendedEmotionResult {
-    const currentTime = this.now(nowOverride);
-    return this.transact(currentTime, (state) => {
-      if (state.fatigue.status !== "SLEEPING") {
-        return false;
-      }
-
-      const wasSleepyMood = state.base.mood === "sleepy";
-      const sleepHours = Math.max(
-        0,
-        (currentTime - state.fatigue.updatedAt) / (60 * 60 * 1000),
+      const elapsed = Math.max(0, currentTime - state.fatigue.updatedAt);
+      const recoveredRaw = computeRawRecoveredFatigue(
+        state.fatigue.fatigue,
+        elapsed,
+        this.fatigueRecoveryPerHour,
       );
-
-      // Recover at least 40 fatigue points on wake, or more if slept longer (20 pts/hour)
-      const recovery = Math.max(40, round1(sleepHours * 20));
       state.fatigue = {
-        status: "AWAKE",
-        fatigue: round1(clampNumber(state.fatigue.fatigue - recovery, 0, 100)),
-        updatedAt: currentTime,
-      };
-
-      // Compute decay under the new AWAKE status so energy isn't sleep-capped
-      // and a fully decayed mood reverts to the baseline rather than "sleepy".
-      const decayedBase = this.computeDecayedBase(state, currentTime);
-      const energyCap = computeEnergyCapFromFatigue(state.fatigue);
-      const targetWakeEnergy = Math.max(
-        decayedBase.energy,
-        Math.min(state.baseline.energy, 6),
-      );
-
-      state.base = {
-        mood: wasSleepyMood ? state.baseline.mood : decayedBase.mood,
-        energy: round1(clampNumber(targetWakeEnergy, 0, energyCap)),
-        valence: decayedBase.valence,
-        description: wasSleepyMood
-          ? `just woke up, ${state.baseline.description}`
-          : decayedBase.description,
+        fatigue: round3(clampNumber(recoveredRaw + delta, 0, 100)),
         updatedAt: currentTime,
       };
     });
@@ -505,76 +597,53 @@ export class EmotionEngine {
 
   /**
    * Full recovery (`rest()`):
-   * - Resets fatigue to 0 and status to "AWAKE"
-   * - Synchronously boosts Base Mood energy (at least max(baseline.energy, 8))
+   * - Resets fatigue to 0
+   * - Boosts Base Mood energy (at least max(baseline.energy, 8)) and restores
+   *   valence to at least baseline.valence
    */
   rest(nowOverride?: number): BlendedEmotionResult {
     const currentTime = this.now(nowOverride);
     return this.transact(currentTime, (state) => {
-      const wasSleepyMood = state.base.mood === "sleepy";
-
-      state.fatigue = {
-        status: "AWAKE",
-        fatigue: 0,
-        updatedAt: currentTime,
-      };
-
-      // Compute decay under the new AWAKE status (see wake() for why).
-      const decayedBase = this.computeDecayedBase(state, currentTime);
-      const boostedEnergy = round1(
-        clampNumber(Math.max(decayedBase.energy, state.baseline.energy, 8), 0, 10),
-      );
-
+      const decayed = this.computeDecayedBase(state, currentTime);
+      state.fatigue = { fatigue: 0, updatedAt: currentTime };
       state.base = {
-        mood: wasSleepyMood ? state.baseline.mood : decayedBase.mood,
-        energy: boostedEnergy,
-        valence: round1(Math.max(decayedBase.valence, state.baseline.valence)),
-        description: wasSleepyMood
-          ? state.baseline.description
-          : decayedBase.description,
+        mood: decayed.mood,
+        energy: Math.max(decayed.energy, state.baseline.energy, 8),
+        valence: Math.max(decayed.valence, state.baseline.valence),
+        description: decayed.description,
         updatedAt: currentTime,
       };
     });
   }
 
   /**
-   * Query current fatigue state (`fatigue_status()`).
+   * Query current lazily recovered fatigue state (`fatigue_status()`).
    */
   getFatigueStatus(nowOverride?: number): BlendedEmotionResult["fatigue"] {
     const currentTime = this.now(nowOverride);
     const state = this.storage.load(currentTime);
-    return EmotionEngine.fatigueResult(state.fatigue);
+    return this.computeEffectiveFatigue(state.fatigue, currentTime);
   }
 
   /**
-   * Set fatigue value (0–100) and synchronize Base Mood energy ceiling.
+   * Set fatigue value (0–100) directly. Ignores non-finite inputs.
+   * Persisted Base Mood energy is left intact because `computeBlend()`
+   * applies the fatigue energy cap dynamically, allowing energy to rebound
+   * naturally as fatigue recovers over idle time.
    */
   setFatigue(
     fatigueValue: number,
     nowOverride?: number,
   ): BlendedEmotionResult {
     const currentTime = this.now(nowOverride);
+    if (!Number.isFinite(fatigueValue)) {
+      return this.getBlendedEmotion(currentTime);
+    }
     return this.transact(currentTime, (state) => {
       state.fatigue = {
-        status: state.fatigue.status,
-        fatigue: round1(clampNumber(fatigueValue, 0, 100)),
-        // Preserve the sleep-start timestamp while SLEEPING (mirrors sleep())
-        // so wake() still counts the full sleep duration.
-        updatedAt:
-          state.fatigue.status === "SLEEPING"
-            ? state.fatigue.updatedAt
-            : currentTime,
+        fatigue: round3(clampNumber(fatigueValue, 0, 100)),
+        updatedAt: currentTime,
       };
-
-      // Clamp persisted base energy down to the new fatigue ceiling without
-      // perturbing mood, valence, description, or the 6h decay timer.
-      const energyCap = computeEnergyCapFromFatigue(state.fatigue);
-      if (state.base.energy > energyCap) {
-        state.base = {
-          ...state.base,
-          energy: energyCap,
-        };
-      }
     });
   }
 
@@ -586,16 +655,12 @@ export class EmotionEngine {
     nowOverride?: number,
   ): PersonalityBaseline {
     const currentTime = this.now(nowOverride);
-    const state = this.loadState(currentTime);
-
-    state.baseline = {
-      mood: normalizeText(baseline.mood, state.baseline.mood),
-      energy: normalizeNumber(baseline.energy, state.baseline.energy, 0, 10),
-      valence: normalizeNumber(baseline.valence, state.baseline.valence, 0, 10),
-      description: normalizeText(baseline.description, state.baseline.description),
-    };
-
-    this.storage.save(state);
-    return { ...state.baseline };
+    return this.storage.withLock(() => {
+      const state = this.storage.load(currentTime);
+      this.pruneExpiredContext(state, currentTime);
+      state.baseline = normalizeBaseline(baseline, state.baseline);
+      this.storage.save(state);
+      return { ...state.baseline };
+    });
   }
 }

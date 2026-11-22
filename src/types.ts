@@ -2,14 +2,12 @@
  * Data models and interfaces for the Layered Emotion & Fatigue System Plugin.
  */
 
-export type SleepStatus = "AWAKE" | "SLEEPING";
-
 export type DecayCurve = "linear" | "exponential";
 
 /**
- * 1. Default Personality Baseline (可配置默认人格基线)
- * - energy: 0–10 (精力/活跃度)
- * - valence: 0–10 (情绪正负向/愉悦度)
+ * 1. Default Personality Baseline (configurable resting persona)
+ * - energy: 0–10 (energy / activity level)
+ * - valence: 0–10 (emotional positivity / mood valence)
  */
 export interface PersonalityBaseline {
   mood: string;
@@ -19,7 +17,7 @@ export interface PersonalityBaseline {
 }
 
 /**
- * 2. Base Mood (底层情绪 — 身份级共享，6小时衰减回落至默认人格基线)
+ * 2. Base Mood (shared per identity; lazily decays over 6h back to baseline)
  */
 export interface BaseMoodState {
   mood: string;
@@ -30,7 +28,7 @@ export interface BaseMoodState {
 }
 
 /**
- * 3. Context Mood (场景情绪 — 身份级共享，2小时衰减过期)
+ * 3. Context Mood (shared per identity; lazily decays and expires after 2h)
  *
  * One shared short-term mood per user identity: a mood shift set in any
  * session is visible to every session of that identity until it decays.
@@ -43,12 +41,25 @@ export interface ContextMoodState {
 }
 
 /**
- * 4. Fatigue System (疲劳与睡眠状态 — 身份级共享)
+ * 4. Fatigue System (shared per identity; driven by workload and lazy idle recovery)
  */
 export interface FatigueState {
-  status: SleepStatus;
   fatigue: number; // 0–100
   updatedAt: number;
+}
+
+/**
+ * Workload event used to accumulate fatigue after completed turns/tool runs.
+ */
+export interface WorkloadInput {
+  /** Number of completed LLM turns (default: 1) */
+  turns?: number;
+  /** Number of non-passive tool calls executed (default: 0) */
+  toolCalls?: number;
+  /** Number of failed tool calls (default: 0) */
+  toolErrors?: number;
+  /** Explicit fatigue delta override (0–100); bypasses turn/tool formula when provided */
+  fatigueDelta?: number;
 }
 
 /**
@@ -87,7 +98,6 @@ export interface BlendedEmotionResult {
     energy: number;
   };
   fatigue: {
-    status: SleepStatus;
     value: number;
     energyCap: number;
     updatedAt: number;
@@ -109,14 +119,17 @@ export interface EmotionSystemStatus {
         blendedValence: number;
       })
     | null;
-  fatigue: BlendedEmotionResult["fatigue"];
+  blended: BlendedEmotionResult["blended"];
+  fatigue: BlendedEmotionResult["fatigue"] & {
+    raw: FatigueState;
+  };
 }
 
 /**
  * Configuration options for EmotionEngine.
  */
 export interface EmotionEngineOptions {
-  /** Path to persistent JSON file. Defaults to PI_EMOTION_STATE_PATH or ~/.pi/agent/emotion-state.json */
+  /** Path to persistent JSON file. Defaults to PI_EMOTION_STATE_PATH, per-user file when PI_EMOTION_USER is set, or ~/.pi/agent/emotion-state.json */
   storagePath?: string;
   /**
    * User identity for multi-user isolation on a shared machine/account.
@@ -136,6 +149,20 @@ export interface EmotionEngineOptions {
   contextWeight?: number;
   /** Interpolation curve for lazy decay (default: "linear") */
   decayCurve?: DecayCurve;
+  /** Passive idle fatigue recovery in points per hour (default: 15) */
+  fatigueRecoveryPerHour?: number;
+  /** Fatigue added per completed turn (default: 2.0) */
+  fatiguePerTurn?: number;
+  /** Additional fatigue per executed tool call (default: 0.5) */
+  fatiguePerToolCall?: number;
+  /** Additional fatigue per failed tool call (default: 1.0) */
+  fatiguePerToolError?: number;
+  /** Maximum fatigue added per turn (default: 12.0) */
+  maxFatiguePerTurn?: number;
+  /** Fatigue threshold above which high exhaustion drags down blended valence (default: 60) */
+  highFatigueValenceThreshold?: number;
+  /** Maximum valence drag at fatigue = 100 (default: 1.5) */
+  maxFatigueValencePenalty?: number;
   /** Optional clock override for deterministic testing */
   now?: () => number;
 }

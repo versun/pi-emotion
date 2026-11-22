@@ -2,9 +2,10 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { EmotionEngine } from "./engine.ts";
 import { buildEmotionContextBlock } from "./prompt.ts";
 import {
+  EMOTION_TOOL_NAMES,
   refreshUiStatus,
   registerEmotionToolsAndCommands,
-  resolveChatId,
+  resolveSessionId,
 } from "./tools.ts";
 import type { EmotionEngineOptions } from "./types.ts";
 
@@ -41,7 +42,7 @@ export function createEmotionExtension(options: EmotionEngineOptions = {}) {
     pi.on("before_agent_start", async (event, ctx) => {
       const eng = engineFor();
       const state = eng.getBlendedEmotion();
-      const contextBlock = buildEmotionContextBlock(state, resolveChatId(ctx));
+      const contextBlock = buildEmotionContextBlock(state, resolveSessionId(ctx));
 
       refreshUiStatus(eng, ctx, state);
 
@@ -58,6 +59,38 @@ export function createEmotionExtension(options: EmotionEngineOptions = {}) {
       return {
         systemPrompt: `${event.systemPrompt}\n\n${contextBlock}`,
       };
+    });
+
+    // Post-Turn Hook: automatically accumulate workload fatigue from completed turns & tools
+    pi.on("turn_end", async (event, ctx) => {
+      const toolResults = event?.toolResults ?? [];
+
+      // Skip cancelled or provider-errored turns that performed no work
+      if (
+        (event?.outcome === "aborted" || event?.outcome === "error") &&
+        toolResults.length === 0
+      ) {
+        return;
+      }
+
+      const eng = engineFor();
+
+      // If this turn successfully invoked `rest`, keep fatigue at 0 instead of immediately adding back
+      if (toolResults.some((r) => r?.toolName === "rest" && !r.isError)) {
+        refreshUiStatus(eng, ctx);
+        return;
+      }
+
+      let toolCalls = 0;
+      let toolErrors = 0;
+      for (const result of toolResults) {
+        if (!result || EMOTION_TOOL_NAMES.has(result.toolName)) continue;
+        toolCalls += 1;
+        if (result.isError) toolErrors += 1;
+      }
+
+      const state = eng.recordWorkload({ turns: 1, toolCalls, toolErrors });
+      refreshUiStatus(eng, ctx, state);
     });
   };
 
