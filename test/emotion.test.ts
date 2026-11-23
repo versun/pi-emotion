@@ -330,7 +330,7 @@ describe("Layered Emotion & Fatigue System Plugin", () => {
       );
 
       // Simulate a turn_end with 4 coding tool calls and 1 error:
-      // fatigue += 2.0 (turn) + 4 * 0.5 (tools) + 1 * 1.0 (error) = 5.0
+      // fatigue += 0.2 (turn) + 4 * 0.05 (tools) + 1 * 0.1 (error) = 0.5
       const turnEndHandlers = handlers.get("turn_end") ?? [];
       assert.equal(turnEndHandlers.length, 1);
       await turnEndHandlers[0](
@@ -346,7 +346,7 @@ describe("Layered Emotion & Fatigue System Plugin", () => {
         },
         mockCtx,
       );
-      assert.equal(ext.engine.getBlendedEmotion().fatigue.value, 5);
+      assert.equal(ext.engine.getBlendedEmotion().fatigue.value, 0.5);
 
       // Trigger Pre-Prompt Hook (before_agent_start)
       const beforeStartHandlers = handlers.get("before_agent_start") ?? [];
@@ -367,7 +367,7 @@ describe("Layered Emotion & Fatigue System Plugin", () => {
         promptEvent.systemPromptOptions.sections.emotion_and_fatigue;
       assert.ok(sectionText.includes("[Emotion & Fatigue Context Block]"));
       assert.ok(sectionText.includes("BLENDED: playful"));
-      assert.ok(sectionText.includes("FATIGUE: 5/100"));
+      assert.ok(sectionText.includes("FATIGUE: 0.5/100"));
       assert.equal(sectionText.includes("Session ID"), false);
       assert.equal(sectionText.includes("Mind-Body Sync"), false);
       assert.equal(sectionText.includes("SLEEPING"), false);
@@ -389,12 +389,12 @@ describe("Layered Emotion & Fatigue System Plugin", () => {
       // Verify CLI command dispatcher works for status, get, and workload
       const getJson = JSON.parse(executeCliCommand(ext.engine, ["get"]));
       assert.equal(getJson.blended.mood, "playful");
-      assert.equal(getJson.fatigue.value, 5);
+      assert.equal(getJson.fatigue.value, 0.5);
 
       const workloadJson = JSON.parse(
         executeCliCommand(ext.engine, ["workload", "1", "2", "0"]),
       );
-      assert.equal(workloadJson.fatigue.value, 8); // 5 + (2 + 2*0.5)
+      assert.equal(workloadJson.fatigue.value, 0.8); // 0.5 + (0.2 + 2*0.05)
     }));
 
   it("6. Workload edge cases: recovery before accumulation, per-turn cap, zero-delta no-op, and rest turn_end guard", () =>
@@ -409,23 +409,23 @@ describe("Layered Emotion & Fatigue System Plugin", () => {
       // Build fatigue to 45 at t = 0
       engine.setFatigue(45);
 
-      // Idle 2 hours (recovers 30 pts -> effective fatigue 15), then complete 1 turn (+2)
-      // Must apply recovery BEFORE adding workload: 15 + 2 = 17 (NOT 45 + 2 = 47)
+      // Idle 2 hours (recovers 30 pts -> effective fatigue 15), then complete 1 turn (+0.2)
+      // Must apply recovery BEFORE adding workload: 15 + 0.2 = 15.2 (NOT 45 + 0.2 = 45.2)
       currentTime += 2 * 60 * 60 * 1000;
       const afterBreak = engine.recordWorkload({ turns: 1 });
-      assert.equal(afterBreak.fatigue.value, 17);
+      assert.equal(afterBreak.fatigue.value, 15.2);
 
-      // Massive single-turn parallel batch is capped at maxFatiguePerTurn (default 12)
+      // Massive single-turn parallel batch is capped at maxFatiguePerTurn (default 1.2)
       const afterBurst = engine.recordWorkload({
         turns: 1,
         toolCalls: 40,
         toolErrors: 10,
       });
-      assert.equal(afterBurst.fatigue.value, 29); // 17 + 12
+      assert.equal(afterBurst.fatigue.value, 16.4); // 15.2 + 1.2
 
-      // Multi-turn workload scales the per-turn cap with `turns` instead of clipping to 12
+      // Multi-turn workload scales the per-turn cap with `turns` instead of clipping to 1.2
       const afterMultiTurn = engine.recordWorkload({ turns: 10 });
-      assert.equal(afterMultiTurn.fatigue.value, 49); // 29 + 20
+      assert.equal(afterMultiTurn.fatigue.value, 18.4); // 16.4 + 2
 
       // Zero-delta workload is a no-op and does not advance fatigue.updatedAt
       const prevUpdatedAt = afterMultiTurn.fatigue.updatedAt;
@@ -433,9 +433,9 @@ describe("Layered Emotion & Fatigue System Plugin", () => {
       const noop = engine.recordWorkload({ turns: 0, toolCalls: 0, toolErrors: 0 });
       assert.equal(noop.fatigue.updatedAt, prevUpdatedAt);
 
-      // Explicit fatigueDelta override: 49 - (15 / 60) + 10 = 58.75 -> 58.8
+      // Explicit fatigueDelta override: 18.4 - (15 / 60) + 10 = 28.15 -> 28.2
       const explicit = engine.recordWorkload({ fatigueDelta: 10 });
-      assert.equal(explicit.fatigue.value, 58.8);
+      assert.equal(explicit.fatigue.value, 28.2);
 
       // In Pi extension: a turn_end containing successful `rest` leaves fatigue at 0
       const { pi, handlers } = createMockPi();
@@ -465,7 +465,7 @@ describe("Layered Emotion & Fatigue System Plugin", () => {
         { turnIndex: 4, toolResults: [{ toolName: "rest", isError: true }] },
         { hasUI: false },
       );
-      assert.equal(engine.getBlendedEmotion().fatigue.value, 2);
+      assert.equal(engine.getBlendedEmotion().fatigue.value, 0.2);
 
       // highFatigueValenceThreshold = 100 disables valence drag even at fatigue = 100
       const noDrag = new EmotionEngine({
@@ -488,7 +488,7 @@ describe("Layered Emotion & Fatigue System Plugin", () => {
       hardened.setFatigue(Number.NaN);
       assert.equal(hardened.getBlendedEmotion().fatigue.value, 40);
       const afterNaNOptsWork = hardened.recordWorkload({ turns: 1 });
-      assert.equal(afterNaNOptsWork.fatigue.value, 42);
+      assert.equal(afterNaNOptsWork.fatigue.value, 40.2);
       assert.equal(hardened.getStatus().blended.energy, afterNaNOptsWork.blended.energy);
     }));
 
@@ -847,7 +847,7 @@ describe("Layered Emotion & Fatigue System Plugin", () => {
       assert.ok(statuses[0][1].startsWith("pi-emotion-test-alice·"));
       assert.equal(statuses[1][1], statuses[0][1]);
       assert.ok(
-        statuses[2][1].includes("F:2.5%"),
+        statuses[2][1].includes("F:0.3%"),
         `Expected updated fatigue badge, got ${statuses[2][1]}`,
       );
     }));
@@ -952,13 +952,13 @@ describe("Layered Emotion & Fatigue System Plugin", () => {
       const engine = ext.engine;
 
       // 30 rapid turns spaced 10s apart (5 minutes total = 1.25 pts idle recovery at 15 pts/hr).
-      // Exact accumulation: 30 * 2 - 29 * (15 * 10 / 3600) = 60 - 1.2083 = 58.7917 -> 58.8.
+      // Exact accumulation: 30 * 0.2 - 29 * (15 * 10 / 3600) = 6 - 1.2083 = 4.7917 -> 4.8.
       engine.recordWorkload({ turns: 1 });
       for (let i = 0; i < 29; i += 1) {
         currentTime += 10_000;
         engine.recordWorkload({ turns: 1 });
       }
-      assert.equal(engine.getBlendedEmotion().fatigue.value, 58.8);
+      assert.equal(engine.getBlendedEmotion().fatigue.value, 4.8);
 
       // Huge turns overflows safely to max fatigue 100 instead of NaN/0
       const overflowed = engine.recordWorkload({ turns: 1e308 });
@@ -1054,7 +1054,7 @@ describe("Layered Emotion & Fatigue System Plugin", () => {
       assert.equal(fs.existsSync(lockPath), false);
       assert.equal(fs.existsSync(`${lockPath}.reclaim`), false);
 
-      // Launch 6 concurrent child processes: 5 adding 4 pts workload each (turns=1, toolCalls=4)
+      // Launch 6 concurrent child processes: 5 adding 0.4 pts workload each (turns=1, toolCalls=4)
       // plus 1 setting shared context mood. All 5 increments and the context write must survive.
       await Promise.all([
         runCliChild(["workload", "1", "4", "0"]),
@@ -1066,10 +1066,10 @@ describe("Layered Emotion & Fatigue System Plugin", () => {
       ]);
 
       const final = engine.getBlendedEmotion();
-      // Expected: 5 (initial) + 5 * 4 = 25 (tiny sub-second idle recovery < 0.05)
+      // Expected: 5 (initial) + 5 * 0.4 = 7 (tiny sub-second idle recovery < 0.05)
       assert.ok(
-        final.fatigue.value >= 24.9 && final.fatigue.value <= 25,
-        `Expected ~25 fatigue without lost updates, got ${final.fatigue.value}`,
+        final.fatigue.value >= 6.9 && final.fatigue.value <= 7,
+        `Expected ~7 fatigue without lost updates, got ${final.fatigue.value}`,
       );
       assert.ok(final.context, "Concurrent set-context must not be clobbered by workload writes");
       assert.equal(final.context.mood, "excited");

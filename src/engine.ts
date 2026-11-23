@@ -36,16 +36,16 @@ export const DEFAULT_CONTEXT_WEIGHT = 0.65;
 export const DEFAULT_FATIGUE_RECOVERY_PER_HOUR = 15;
 
 /** Default fatigue added per completed agent turn */
-export const DEFAULT_FATIGUE_PER_TURN = 2.0;
+export const DEFAULT_FATIGUE_PER_TURN = 0.2;
 
 /** Default additional fatigue per non-passive tool call */
-export const DEFAULT_FATIGUE_PER_TOOL_CALL = 0.5;
+export const DEFAULT_FATIGUE_PER_TOOL_CALL = 0.05;
 
 /** Default additional fatigue per failed tool call */
-export const DEFAULT_FATIGUE_PER_TOOL_ERROR = 1.0;
+export const DEFAULT_FATIGUE_PER_TOOL_ERROR = 0.1;
 
 /** Default cap on fatigue added by a single workload event */
-export const DEFAULT_MAX_FATIGUE_PER_TURN = 12.0;
+export const DEFAULT_MAX_FATIGUE_PER_TURN = 1.2;
 
 /** Fatigue threshold above which exhaustion begins weighing down blended valence */
 export const DEFAULT_HIGH_FATIGUE_VALENCE_THRESHOLD = 60;

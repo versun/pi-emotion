@@ -147,13 +147,13 @@ export interface EmotionEngineOptions {
   decayCurve?: DecayCurve;
   /** Passive idle fatigue recovery in points per hour (default: 15) */
   fatigueRecoveryPerHour?: number;
-  /** Fatigue added per completed turn (default: 2.0) */
+  /** Fatigue added per completed turn (default: 0.2) */
   fatiguePerTurn?: number;
-  /** Additional fatigue per executed tool call (default: 0.5) */
+  /** Additional fatigue per executed tool call (default: 0.05) */
   fatiguePerToolCall?: number;
-  /** Additional fatigue per failed tool call (default: 1.0) */
+  /** Additional fatigue per failed tool call (default: 0.1) */
   fatiguePerToolError?: number;
-  /** Maximum fatigue added per turn (default: 12.0) */
+  /** Maximum fatigue added per turn (default: 1.2) */
   maxFatiguePerTurn?: number;
   /** Fatigue threshold above which high exhaustion drags down blended valence (default: 60) */
   highFatigueValenceThreshold?: number;
